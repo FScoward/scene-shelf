@@ -48,7 +48,8 @@ private final class ActivationRecorder {
 struct SceneShelfPresentationTestRunner {
     static func main() {
         let panel = SceneShelfPanel(
-            contentRect: NSRect(origin: .zero, size: SceneShelfLayout.viewportSize)
+            contentRect: NSRect(origin: .zero, size: SceneShelfLayout.viewportSize),
+            increaseContrast: false
         )
 
         runTest {
@@ -75,12 +76,20 @@ struct SceneShelfPresentationTestRunner {
                 "shelf panel must remain an accessory panel, not a main window"
             )
         }
+        runTest {
+            expect(
+                panel.appearance?.name == .darkAqua,
+                "shelf panel uses the darkAqua appearance"
+            )
+        }
+        runTest(testPanelHighContrastAppearance)
         runTest(testFailureMessageFormat)
         runTest(testLongContentLayout)
         runTest(testShelfViewportMaterialSurface)
         runTest(testShelfRootClipSurface)
         runTest(testReadableContentSurfacePresentation)
         runTest(testLiquidGlassSurfaceAndPolicy)
+        runTest(testPrimaryButtonDisabledInteraction)
         runTest(testPanelScrollOperation)
         runTest(testShelfActivation)
         runTest(testPrimaryCardHitArea)
@@ -197,7 +206,7 @@ struct SceneShelfPresentationTestRunner {
         )
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.appearance = NSAppearance(named: .aqua)
+        panel.appearance = NSAppearance(named: .darkAqua)
         panel.contentView = hosting
         panel.contentView?.layoutSubtreeIfNeeded()
         hosting.layoutSubtreeIfNeeded()
@@ -215,10 +224,10 @@ struct SceneShelfPresentationTestRunner {
             "shelf viewport material covers the full fixed viewport"
         )
         expect(
-            background.material == .sidebar
+            background.material == .hudWindow
                 && background.blendingMode == .behindWindow
                 && background.state == .active,
-            "shelf viewport uses active behind-window sidebar material"
+            "shelf viewport uses active behind-window hud material"
         )
         expect(
             !panel.isOpaque && panel.backgroundColor?.isEqual(NSColor.clear) == true,
@@ -277,28 +286,63 @@ struct SceneShelfPresentationTestRunner {
     }
 
     private static func testLiquidGlassSurfaceAndPolicy() {
-        expect(
-            SceneShelfGlassPresentation.policy(
-                for: OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0)
-            ) == .nativeGlass,
-            "macOS 26 selects native glass presentation"
+        let nativeCard = SceneShelfGlassPresentation.renderingConfiguration(
+            for: .card,
+            version: OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0),
+            reduceTransparency: false,
+            increasedContrast: false
         )
         expect(
-            SceneShelfGlassPresentation.policy(
-                for: OperatingSystemVersion(majorVersion: 25, minorVersion: 0, patchVersion: 0)
-            ) == .materialFallback,
-            "pre-macOS 26 keeps the material fallback"
+            nativeCard.platform == .nativeGlass
+                && nativeCard.surface == .clear
+                && nativeCard.isInteractive
+                && nativeCard.outlineOpacity == 0.14
+                && nativeCard.button == .glass,
+            "native card config uses clear interactive glass with a light outline"
         )
 
-        let expectedCurrentPolicy: SceneShelfGlassPolicy
-        if #available(macOS 26.0, *) {
-            expectedCurrentPolicy = .nativeGlass
-        } else {
-            expectedCurrentPolicy = .materialFallback
-        }
+        let nativeReduced = SceneShelfGlassPresentation.renderingConfiguration(
+            for: .card,
+            version: OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0),
+            reduceTransparency: true,
+            increasedContrast: false
+        )
         expect(
-            SceneShelfGlassPresentation.currentPolicy == expectedCurrentPolicy,
-            "current OS selects the matching glass presentation policy"
+            nativeReduced.surface == .regular
+                && nativeReduced.isInteractive
+                && nativeReduced.outlineOpacity == 0.45
+                && nativeReduced.button == .glass,
+            "reduced transparency uses regular interactive glass with a strong outline"
+        )
+
+        let nativeHighContrast = SceneShelfGlassPresentation.renderingConfiguration(
+            for: .header,
+            version: OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0),
+            reduceTransparency: false,
+            increasedContrast: true
+        )
+        expect(
+            nativeHighContrast.platform == .nativeGlass
+                && nativeHighContrast.surface == .regular
+                && !nativeHighContrast.isInteractive
+                && nativeHighContrast.outlineOpacity == 0.45
+                && nativeHighContrast.button == .glass,
+            "increased contrast uses regular header glass with a strong outline"
+        )
+
+        let fallbackHeader = SceneShelfGlassPresentation.renderingConfiguration(
+            for: .header,
+            version: OperatingSystemVersion(majorVersion: 25, minorVersion: 0, patchVersion: 0),
+            reduceTransparency: false,
+            increasedContrast: false
+        )
+        expect(
+            fallbackHeader.platform == .materialFallback
+                && fallbackHeader.surface == .clear
+                && !fallbackHeader.isInteractive
+                && fallbackHeader.outlineOpacity == 0.14
+                && fallbackHeader.button == .bordered,
+            "pre-macOS 26 uses the material and bordered fallback"
         )
 
         var activations = 0
@@ -335,6 +379,7 @@ struct SceneShelfPresentationTestRunner {
             backing: .buffered,
             defer: false
         )
+        window.appearance = NSAppearance(named: .darkAqua)
         window.contentView = hosting
         window.makeKeyAndOrderFront(nil)
         window.displayIfNeeded()
@@ -485,6 +530,79 @@ struct SceneShelfPresentationTestRunner {
             "showShelf presents the keyable shelf panel"
         )
         panel.orderOut(nil)
+    }
+
+    private static func testPanelHighContrastAppearance() {
+        let panel = SceneShelfPanel(
+            contentRect: NSRect(origin: .zero, size: SceneShelfLayout.viewportSize),
+            increaseContrast: true
+        )
+        expect(
+            panel.appearance?.name == .darkAqua
+                && panel.configuredAppearanceName == .accessibilityHighContrastDarkAqua,
+            "increased contrast selects the high contrast darkAqua appearance"
+        )
+        panel.orderOut(nil)
+    }
+
+    private static func testPrimaryButtonDisabledInteraction() {
+        let expectedSize = CGSize(width: 220, height: 52)
+        var disabledActivations = 0
+        let disabledHosting = NSHostingView(
+            rootView: Button("主要操作") {
+                disabledActivations += 1
+            }
+            .sceneShelfGlassPrimaryButtonStyle()
+            .disabled(true)
+            .frame(width: expectedSize.width, height: expectedSize.height)
+        )
+        disabledHosting.frame = NSRect(origin: .zero, size: expectedSize)
+        disabledHosting.layoutSubtreeIfNeeded()
+        let disabledWindow = HitRecordingWindow(
+            contentRect: NSRect(origin: .zero, size: expectedSize),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        disabledWindow.appearance = NSAppearance(named: .darkAqua)
+        disabledWindow.contentView = disabledHosting
+        disabledWindow.makeKeyAndOrderFront(nil)
+        disabledWindow.displayIfNeeded()
+        disabledHosting.layoutSubtreeIfNeeded()
+        sendClick(to: disabledWindow, at: NSPoint(x: 110, y: 26))
+        expect(
+            disabledActivations == 0,
+            "disabled major glass button does not activate"
+        )
+        disabledWindow.orderOut(nil)
+
+        var enabledActivations = 0
+        let enabledHosting = NSHostingView(
+            rootView: Button("主要操作") {
+                enabledActivations += 1
+            }
+            .sceneShelfGlassPrimaryButtonStyle()
+            .frame(width: expectedSize.width, height: expectedSize.height)
+        )
+        enabledHosting.frame = NSRect(origin: .zero, size: expectedSize)
+        enabledHosting.layoutSubtreeIfNeeded()
+        let enabledWindow = HitRecordingWindow(
+            contentRect: NSRect(origin: .zero, size: expectedSize),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        enabledWindow.appearance = NSAppearance(named: .darkAqua)
+        enabledWindow.contentView = enabledHosting
+        enabledWindow.makeKeyAndOrderFront(nil)
+        enabledWindow.displayIfNeeded()
+        enabledHosting.layoutSubtreeIfNeeded()
+        sendClick(to: enabledWindow, at: NSPoint(x: 110, y: 26))
+        expect(
+            enabledActivations == 1,
+            "enabled major glass button keeps its activation"
+        )
+        enabledWindow.orderOut(nil)
     }
 
     private static func testPrimaryCardHitArea() {

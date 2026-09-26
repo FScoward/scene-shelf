@@ -6,72 +6,154 @@ public enum SceneShelfGlassSurface: Equatable, Sendable {
     case card
 }
 
-public enum SceneShelfGlassPolicy: Equatable, Sendable {
-    case nativeGlass
-    case materialFallback
+public struct SceneShelfGlassRenderingConfiguration: Equatable, Sendable {
+    public enum Platform: Equatable, Sendable {
+        case nativeGlass
+        case materialFallback
+    }
+
+    public enum Surface: Equatable, Sendable {
+        case clear
+        case regular
+    }
+
+    public enum Button: Equatable, Sendable {
+        case glass
+        case bordered
+    }
+
+    public let platform: Platform
+    public let surface: Surface
+    public let isInteractive: Bool
+    public let outlineOpacity: Double
+    public let button: Button
+
+    public init(
+        platform: Platform,
+        surface: Surface,
+        isInteractive: Bool,
+        outlineOpacity: Double,
+        button: Button
+    ) {
+        self.platform = platform
+        self.surface = surface
+        self.isInteractive = isInteractive
+        self.outlineOpacity = outlineOpacity
+        self.button = button
+    }
 }
 
 public enum SceneShelfGlassPresentation {
     public static let nativeGlassMajorVersion = 26
 
-    public static var currentPolicy: SceneShelfGlassPolicy {
-        if #available(macOS 26.0, *) {
-            return .nativeGlass
-        }
-        return .materialFallback
-    }
+    public static func renderingConfiguration(
+        for surface: SceneShelfGlassSurface,
+        version: OperatingSystemVersion,
+        reduceTransparency: Bool,
+        increasedContrast: Bool
+    ) -> SceneShelfGlassRenderingConfiguration {
+        let platform: SceneShelfGlassRenderingConfiguration.Platform =
+            version.majorVersion >= nativeGlassMajorVersion
+                ? .nativeGlass
+                : .materialFallback
+        let accessibilitySurface = reduceTransparency || increasedContrast
+        let glassSurface: SceneShelfGlassRenderingConfiguration.Surface =
+            accessibilitySurface ? .regular : .clear
+        let button: SceneShelfGlassRenderingConfiguration.Button =
+            platform == .nativeGlass ? .glass : .bordered
 
-    public static func policy(
-        for version: OperatingSystemVersion
-    ) -> SceneShelfGlassPolicy {
-        version.majorVersion >= nativeGlassMajorVersion
-            ? .nativeGlass
-            : .materialFallback
+        return SceneShelfGlassRenderingConfiguration(
+            platform: platform,
+            surface: glassSurface,
+            isInteractive: surface == .card,
+            outlineOpacity: accessibilitySurface ? 0.45 : 0.14,
+            button: button
+        )
     }
 }
 
 private struct SceneShelfGlassSurfaceModifier: ViewModifier {
     let surface: SceneShelfGlassSurface
 
+    @Environment(\.accessibilityReduceTransparency)
+    private var reduceTransparency
+    @Environment(\.colorSchemeContrast)
+    private var colorSchemeContrast
+
     @ViewBuilder
     func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            switch surface {
-            case .header:
-                content.glassEffect(
-                    .regular,
-                    in: RoundedRectangle(cornerRadius: 12)
+        let configuration = SceneShelfGlassPresentation.renderingConfiguration(
+            for: surface,
+            version: ProcessInfo.processInfo.operatingSystemVersion,
+            reduceTransparency: reduceTransparency,
+            increasedContrast: colorSchemeContrast == .increased
+        )
+        let shape = RoundedRectangle(
+            cornerRadius: surface == .header ? 12 : 10,
+            style: .continuous
+        )
+        let tint = configuration.surface == .clear
+            ? Color.black.opacity(0.08)
+            : Color.black.opacity(0.12)
+
+        if #available(macOS 26.0, *), configuration.platform == .nativeGlass {
+            let glass = configuration.surface == .regular ? Glass.regular : Glass.clear
+            let configuredGlass = glass.tint(tint)
+            let interactiveGlass = configuration.isInteractive
+                ? configuredGlass.interactive()
+                : configuredGlass
+            content
+                .glassEffect(interactiveGlass, in: shape)
+                .overlay(
+                    shape
+                        .stroke(.white.opacity(configuration.outlineOpacity), lineWidth: 0.5)
+                        .allowsHitTesting(false)
                 )
-            case .card:
-                content.glassEffect(
-                    .regular.interactive(),
-                    in: RoundedRectangle(cornerRadius: 10)
-                )
-            }
         } else {
             switch surface {
-            case .header:
-                content.background(
-                    .thinMaterial,
-                    in: RoundedRectangle(cornerRadius: 12)
-                )
-            case .card:
-                content.background(
-                    .regularMaterial,
-                    in: RoundedRectangle(cornerRadius: 10)
-                )
+            case .header where configuration.surface == .clear:
+                content
+                    .background(.thinMaterial, in: shape)
+                    .overlay(shape.fill(tint).allowsHitTesting(false))
+                    .overlay(
+                        shape
+                            .stroke(.white.opacity(configuration.outlineOpacity), lineWidth: 0.5)
+                            .allowsHitTesting(false)
+                    )
+            case .card where configuration.surface == .clear,
+                    .header,
+                    .card:
+                content
+                    .background(.regularMaterial, in: shape)
+                    .overlay(shape.fill(tint).allowsHitTesting(false))
+                    .overlay(
+                        shape
+                            .stroke(.white.opacity(configuration.outlineOpacity), lineWidth: 0.5)
+                            .allowsHitTesting(false)
+                    )
             }
         }
     }
 }
 
 private struct SceneShelfGlassPrimaryButtonModifier: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency)
+    private var reduceTransparency
+    @Environment(\.colorSchemeContrast)
+    private var colorSchemeContrast
+
     @ViewBuilder
     func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            content.buttonStyle(.glassProminent)
+        let configuration = SceneShelfGlassPresentation.renderingConfiguration(
+            for: .header,
+            version: ProcessInfo.processInfo.operatingSystemVersion,
+            reduceTransparency: reduceTransparency,
+            increasedContrast: colorSchemeContrast == .increased
+        )
+        if #available(macOS 26.0, *), configuration.button == .glass {
+            content.buttonStyle(.glass)
         } else {
-            content.buttonStyle(.borderedProminent)
+            content.buttonStyle(.bordered)
         }
     }
 }

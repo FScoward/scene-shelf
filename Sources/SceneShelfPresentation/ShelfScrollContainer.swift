@@ -19,7 +19,7 @@ private final class ShelfViewportBackgroundNSView: NSVisualEffectView {
     }
 
     func applyMaterial() {
-        material = .sidebar
+        material = .hudWindow
         blendingMode = .behindWindow
         state = .active
         wantsLayer = true
