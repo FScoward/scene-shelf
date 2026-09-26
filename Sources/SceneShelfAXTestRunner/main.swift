@@ -9,6 +9,100 @@ struct SceneShelfAXTestRunner {
 
     static func main() async {
         await probeSystemBoundaryIfRequested()
+        await run("application catalog permission denied performs zero writes") {
+            let adapter = FakeAXAdapter(
+                permission: .denied,
+                windows: [fixtureWindow()],
+                catalogResult: .failure(.permissionDenied)
+            )
+            let result = await adapter.applicationCatalog()
+            if result.failureReason != .permissionDenied {
+                fail("catalog reason was \(String(describing: result.failureReason))")
+            }
+            if !result.candidates.isEmpty {
+                fail("denied catalog returned \(result.candidates.count) candidates")
+            }
+            let writes = await adapter.currentWriteCount()
+            if writes != 0 {
+                fail("denied catalog performed \(writes) writes")
+            }
+        }
+
+        await run("application catalog normalization excludes unsafe process classes") {
+            let normal = applicationProcess(
+                appName: "Text Editor",
+                bundleIdentifier: "com.example.Editor",
+                processID: 501
+            )
+            let sameBundleDifferentProcess = applicationProcess(
+                appName: "Text Editor",
+                bundleIdentifier: "com.example.Editor",
+                processID: 502
+            )
+            let sceneShelf = applicationProcess(
+                appName: "Scene Shelf",
+                bundleIdentifier: SceneShelfAXContract.sceneShelfBundleIdentifier,
+                processID: 503
+            )
+            let missingBundle = applicationProcess(
+                appName: "No Bundle",
+                bundleIdentifier: nil,
+                processID: 504
+            )
+            let noUserInterface = applicationProcess(
+                appName: "Background Helper",
+                bundleIdentifier: "com.example.Helper",
+                processID: 505,
+                hasUserInterface: false
+            )
+            let background = applicationProcess(
+                appName: "Background Agent",
+                bundleIdentifier: "com.example.Agent",
+                processID: 506,
+                isBackgroundOnly: true
+            )
+
+            let candidates = AXApplicationCatalogNormalizer.normalize([
+                normal,
+                sameBundleDifferentProcess,
+                sceneShelf,
+                missingBundle,
+                noUserInterface,
+                background
+            ])
+
+            expect(candidates.count == 2)
+            expect(candidates.map(\.processID) == [501, 502])
+            expect(candidates[0].id != candidates[1].id)
+            expect(candidates[0].windows[0].identity.bundleIdentifier == "com.example.Editor")
+        }
+
+        await run("application catalog exposes app and window value fields") {
+            let process = applicationProcess(
+                appName: "Text Editor",
+                bundleIdentifier: "com.example.Editor",
+                processID: 601,
+                window: AXWindowSnapshot(
+                    identity: AXWindowIdentity(
+                        bundleIdentifier: "com.example.Editor",
+                        processID: 601,
+                        title: "Draft",
+                        identifier: "draft"
+                    ),
+                    frame: AXFrame(x: 20, y: 40, width: 900, height: 700),
+                    isMinimized: true
+                )
+            )
+            let candidate = AXApplicationCatalogNormalizer.normalize([process]).first
+            expect(candidate?.appName == "Text Editor")
+            expect(candidate?.bundleIdentifier == "com.example.Editor")
+            expect(candidate?.processID == 601)
+            expect(candidate?.windows.first?.identity.title == "Draft")
+            expect(candidate?.windows.first?.identity.identifier == "draft")
+            expect(candidate?.windows.first?.frame == AXFrame(x: 20, y: 40, width: 900, height: 700))
+            expect(candidate?.windows.first?.isMinimized == true)
+        }
+
         await run("permission denied performs zero writes") {
             let adapter = FakeAXAdapter(permission: .denied, windows: [fixtureWindow()])
             let report = await adapter.perform(request(for: fixtureIdentity()))
@@ -380,6 +474,34 @@ struct SceneShelfAXTestRunner {
             operations: [.move]
         )
     }
+
+    private static func applicationProcess(
+        appName: String,
+        bundleIdentifier: String?,
+        processID: Int32,
+        hasUserInterface: Bool = true,
+        isBackgroundOnly: Bool = false,
+        window: AXWindowSnapshot? = nil
+    ) -> AXApplicationProcessSnapshot {
+        let defaultWindow = AXWindowSnapshot(
+            identity: AXWindowIdentity(
+                bundleIdentifier: bundleIdentifier ?? "",
+                processID: processID,
+                title: "\(appName) Window",
+                identifier: "window"
+            ),
+            frame: AXFrame(x: 10, y: 20, width: 640, height: 480),
+            isMinimized: false
+        )
+        return AXApplicationProcessSnapshot(
+            appName: appName,
+            bundleIdentifier: bundleIdentifier,
+            processID: processID,
+            windows: [window ?? defaultWindow],
+            hasUserInterface: hasUserInterface,
+            isBackgroundOnly: isBackgroundOnly
+        )
+    }
 }
 
 private actor FakeAXAdapter: AXWindowAdapter {
@@ -387,6 +509,7 @@ private actor FakeAXAdapter: AXWindowAdapter {
     private var windows: [AXWindowSnapshot]
     private var candidateSequence: [[AXWindowSnapshot]]
     private let discoveryResult: AXWindowDiscoveryResult?
+    private let catalogResult: AXApplicationCatalogResult?
     private(set) var writeCount = 0
     private(set) var observedRequests: [AXOperationRequest] = []
 
@@ -394,12 +517,14 @@ private actor FakeAXAdapter: AXWindowAdapter {
         permission: PermissionState,
         windows: [AXWindowSnapshot],
         candidateSequence: [[AXWindowSnapshot]] = [],
-        discoveryResult: AXWindowDiscoveryResult? = nil
+        discoveryResult: AXWindowDiscoveryResult? = nil,
+        catalogResult: AXApplicationCatalogResult? = nil
     ) {
         self.permission = permission
         self.windows = windows
         self.candidateSequence = candidateSequence
         self.discoveryResult = discoveryResult
+        self.catalogResult = catalogResult
     }
 
     func permissionStatus() -> PermissionStatus {
@@ -419,6 +544,10 @@ private actor FakeAXAdapter: AXWindowAdapter {
 
     func fixtureWindowResult() -> AXWindowDiscoveryResult {
         discoveryResult ?? .success(fixtureWindows())
+    }
+
+    func applicationCatalog() async -> AXApplicationCatalogResult {
+        catalogResult ?? .success([])
     }
 
     func currentWriteCount() -> Int { writeCount }

@@ -65,6 +65,48 @@ public actor AXSystemAdapter: AXWindowAdapter {
         return windows.isEmpty ? .failure(.windowMissing) : .success(windows)
     }
 
+    /// Enumerates running applications and their accessible windows without
+    /// issuing any AX write. The normalizer removes Scene Shelf itself,
+    /// background-only apps, and observations without a usable bundle ID.
+    public func applicationCatalog() -> AXApplicationCatalogResult {
+        guard AXIsProcessTrusted() else {
+            return .failure(.permissionDenied)
+        }
+
+        let processes: [AXApplicationProcessSnapshot] = NSWorkspace.shared.runningApplications.compactMap {
+            application in
+            // Reject observations that can never become a user-visible catalog
+            // candidate before creating an AX application element. This keeps
+            // the live read boundary small while the pure normalizer remains
+            // the source of truth for fixture and value-level filtering.
+            guard let bundleIdentifier = application.bundleIdentifier,
+                  !bundleIdentifier.isEmpty,
+                  bundleIdentifier != SceneShelfAXContract.sceneShelfBundleIdentifier,
+                  application.activationPolicy != .prohibited else {
+                return nil
+            }
+
+            let appElement = AXUIElementCreateApplication(application.processIdentifier)
+            let rawWindows = copyAttribute(appElement, kAXWindowsAttribute) as? [AXUIElement] ?? []
+            let windows: [AXWindowSnapshot] = rawWindows.compactMap { element in
+                snapshot(
+                    of: element,
+                    processID: application.processIdentifier,
+                    bundleIdentifier: bundleIdentifier
+                )
+            }
+            return AXApplicationProcessSnapshot(
+                appName: application.localizedName ?? application.bundleIdentifier ?? "名称不明",
+                bundleIdentifier: bundleIdentifier,
+                processID: application.processIdentifier,
+                windows: windows,
+                hasUserInterface: true,
+                isBackgroundOnly: false
+            )
+        }
+        return .success(AXApplicationCatalogNormalizer.normalize(processes))
+    }
+
     public func perform(_ request: AXOperationRequest) -> AXOperationReport {
         let requested = request.operations
         func report(
@@ -183,7 +225,11 @@ public actor AXSystemAdapter: AXWindowAdapter {
         }
     }
 
-    private func snapshot(of element: AXUIElement, processID: pid_t) -> AXWindowSnapshot? {
+    private func snapshot(
+        of element: AXUIElement,
+        processID: pid_t,
+        bundleIdentifier: String = SceneShelfAXContract.fixtureBundleIdentifier
+    ) -> AXWindowSnapshot? {
         guard let title = copyAttribute(element, kAXTitleAttribute) as? String else {
             return nil
         }
@@ -191,7 +237,7 @@ public actor AXSystemAdapter: AXWindowAdapter {
         let frame = readFrame(from: element)
         let minimized = (copyAttribute(element, kAXMinimizedAttribute) as? Bool) ?? false
         let identity = AXWindowIdentity(
-            bundleIdentifier: SceneShelfAXContract.fixtureBundleIdentifier,
+            bundleIdentifier: bundleIdentifier,
             processID: processID,
             title: title,
             identifier: identifier

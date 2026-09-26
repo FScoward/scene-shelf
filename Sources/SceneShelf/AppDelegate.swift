@@ -23,6 +23,8 @@ final class ShelfViewModel: ObservableObject {
         reason: "起動時に確認しています",
         allowsAXInspection: false
     )
+    @Published private(set) var applicationCandidates: [AXApplicationCandidate] = []
+    @Published private(set) var applicationCatalogMessage = "アプリ候補はまだ確認していません"
     @Published private(set) var fixtureWindows: [AXWindowSnapshot] = []
     @Published private(set) var selectedFixtureIDs: Set<AXWindowIdentity> = []
     @Published var captureName = SceneCaptureFlow.defaultName
@@ -374,6 +376,12 @@ final class ShelfViewModel: ObservableObject {
         if status.state == .denied {
             fixtureWindows = []
             accessibilityMessage = "権限なしではFixtureの検出・操作を行いません"
+            let catalogState = SceneShelfApplicationCatalogPresentation.catalogState(
+                permission: status.state,
+                result: nil
+            )
+            applicationCandidates = catalogState.candidates
+            applicationCatalogMessage = catalogState.message
         } else {
             accessibilityMessage = "許可済みです。対象Fixtureだけを検証できます"
         }
@@ -411,6 +419,31 @@ final class ShelfViewModel: ObservableObject {
             fixtureWindows = discovery.windows
             selectedFixtureIDs = Set(discovery.windows.map(\.identity))
             accessibilityMessage = SceneShelfAXPresentation.discoveryMessage(for: discovery)
+        }
+    }
+
+    /// Reads general application candidates without exposing a write action.
+    /// Fixture save/restore remains on its existing explicit controls.
+    func inspectApplicationCandidates() {
+        let adapter = accessibilityAdapter
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard accessibilityStatus.state == .granted else {
+                let catalogState = SceneShelfApplicationCatalogPresentation.catalogState(
+                    permission: accessibilityStatus.state,
+                    result: nil
+                )
+                applicationCandidates = catalogState.candidates
+                applicationCatalogMessage = catalogState.message
+                return
+            }
+            let result = await adapter.applicationCatalog()
+            let catalogState = SceneShelfApplicationCatalogPresentation.catalogState(
+                permission: accessibilityStatus.state,
+                result: result
+            )
+            applicationCandidates = catalogState.candidates
+            applicationCatalogMessage = catalogState.message
         }
     }
 
@@ -793,6 +826,65 @@ struct ShelfView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("scene-management-status")
             }
+
+            Divider()
+            GroupBox("一般アプリ候補（読み取り専用）") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(SceneShelfApplicationCatalogPresentation.readOnlyNotice)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Button("アプリ候補を確認") {
+                        viewModel.inspectApplicationCandidates()
+                    }
+                    .accessibilityLabel("読み取り専用のアプリ候補を確認")
+                    .accessibilityIdentifier(
+                        SceneShelfApplicationCatalogPresentation.inspectButtonIdentifier
+                    )
+                    Text(viewModel.applicationCatalogMessage)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if viewModel.applicationCandidates.isEmpty {
+                        Text("確認できるアプリ候補はありません")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(viewModel.applicationCandidates) { candidate in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(
+                                        SceneShelfApplicationCatalogPresentation.candidateLabel(
+                                            for: candidate
+                                        )
+                                    )
+                                    .font(.caption)
+                                    ForEach(
+                                        SceneShelfApplicationCatalogPresentation.windowRows(
+                                            for: candidate
+                                        )
+                                    ) { row in
+                                        Text(
+                                            row.label
+                                        )
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 7))
+                            }
+                        }
+                        .accessibilityIdentifier(
+                            SceneShelfApplicationCatalogPresentation.listIdentifier
+                        )
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .accessibilityIdentifier("application-catalog-read-only")
 
             Divider()
             GroupBox("アクセシビリティ技術検証") {

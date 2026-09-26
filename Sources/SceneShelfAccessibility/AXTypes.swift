@@ -3,6 +3,7 @@ import Foundation
 /// The only bundle that the P0-2 adapter is allowed to inspect or modify.
 public enum SceneShelfAXContract {
     public static let fixtureBundleIdentifier = "com.fscoward.SceneShelfAXFixture"
+    public static let sceneShelfBundleIdentifier = "com.fscoward.sceneshelf"
     public static let fixtureMainWindowIdentifier = "main"
     public static let fixtureMainWindowTitle = "Scene Shelf AX Fixture - Main"
 }
@@ -82,6 +83,118 @@ public struct AXWindowSnapshot: Equatable, Hashable, Sendable, Identifiable {
         self.identity = identity
         self.frame = frame
         self.isMinimized = isMinimized
+    }
+}
+
+/// A read-only process observation used by the general application catalog.
+/// It deliberately contains only copied values; no AXUIElement or AppKit
+/// object crosses the Accessibility boundary.
+public struct AXApplicationProcessSnapshot: Equatable, Sendable {
+    public let appName: String
+    public let bundleIdentifier: String?
+    public let processID: Int32
+    public let windows: [AXWindowSnapshot]
+    public let hasUserInterface: Bool
+    public let isBackgroundOnly: Bool
+
+    public init(
+        appName: String,
+        bundleIdentifier: String?,
+        processID: Int32,
+        windows: [AXWindowSnapshot],
+        hasUserInterface: Bool,
+        isBackgroundOnly: Bool
+    ) {
+        self.appName = appName
+        self.bundleIdentifier = bundleIdentifier
+        self.processID = processID
+        self.windows = windows
+        self.hasUserInterface = hasUserInterface
+        self.isBackgroundOnly = isBackgroundOnly
+    }
+}
+
+/// A safe, grouped-by-process application candidate for the read-only UI.
+public struct AXApplicationCandidate: Equatable, Sendable, Identifiable {
+    public let appName: String
+    public let bundleIdentifier: String
+    public let processID: Int32
+    public let windows: [AXWindowSnapshot]
+
+    public var id: String {
+        "\(bundleIdentifier):\(processID)"
+    }
+
+    public init(
+        appName: String,
+        bundleIdentifier: String,
+        processID: Int32,
+        windows: [AXWindowSnapshot]
+    ) {
+        self.appName = appName
+        self.bundleIdentifier = bundleIdentifier
+        self.processID = processID
+        self.windows = windows
+    }
+}
+
+public struct AXApplicationCatalogResult: Equatable, Sendable {
+    public let candidates: [AXApplicationCandidate]
+    public let failureReason: FailureReason?
+
+    public var succeeded: Bool {
+        failureReason == nil
+    }
+
+    public init(
+        candidates: [AXApplicationCandidate],
+        failureReason: FailureReason? = nil
+    ) {
+        self.candidates = candidates
+        self.failureReason = failureReason
+    }
+
+    public static func success(_ candidates: [AXApplicationCandidate]) -> AXApplicationCatalogResult {
+        AXApplicationCatalogResult(candidates: candidates)
+    }
+
+    public static func failure(_ reason: FailureReason) -> AXApplicationCatalogResult {
+        AXApplicationCatalogResult(candidates: [], failureReason: reason)
+    }
+}
+
+/// Pure normalization for a process observation list. This is the only place
+/// where filtering rules for the P1-8 candidate surface are defined.
+public enum AXApplicationCatalogNormalizer {
+    public static func normalize(
+        _ processes: [AXApplicationProcessSnapshot],
+        excludingBundleIdentifier: String = SceneShelfAXContract.sceneShelfBundleIdentifier
+    ) -> [AXApplicationCandidate] {
+        processes.compactMap { process in
+            guard let bundleIdentifier = process.bundleIdentifier,
+                  !bundleIdentifier.isEmpty,
+                  bundleIdentifier != excludingBundleIdentifier,
+                  process.hasUserInterface,
+                  !process.isBackgroundOnly,
+                  !process.windows.isEmpty else {
+                return nil
+            }
+            return AXApplicationCandidate(
+                appName: process.appName,
+                bundleIdentifier: bundleIdentifier,
+                processID: process.processID,
+                windows: process.windows
+            )
+        }
+        .sorted {
+            if $0.appName == $1.appName {
+                if $0.bundleIdentifier == $1.bundleIdentifier {
+                    return $0.processID < $1.processID
+                }
+                return $0.bundleIdentifier < $1.bundleIdentifier
+            }
+            return $0.appName < $1.appName
+        }
     }
 }
 
@@ -273,6 +386,7 @@ public protocol AXWindowAdapter: Sendable {
     func permissionStatus() async -> PermissionStatus
     func fixtureWindows() async -> [AXWindowSnapshot]
     func fixtureWindowResult() async -> AXWindowDiscoveryResult
+    func applicationCatalog() async -> AXApplicationCatalogResult
     func perform(_ request: AXOperationRequest) async -> AXOperationReport
 }
 
@@ -282,6 +396,12 @@ public extension AXWindowAdapter {
     /// discovery failure reason that an empty list alone would lose.
     func fixtureWindowResult() async -> AXWindowDiscoveryResult {
         .success(await fixtureWindows())
+    }
+
+    /// Existing fixture-only fakes remain source-compatible. The live adapter
+    /// overrides this boundary with the read-only process enumeration.
+    func applicationCatalog() async -> AXApplicationCatalogResult {
+        .success([])
     }
 }
 

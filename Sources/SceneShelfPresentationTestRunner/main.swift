@@ -83,6 +83,8 @@ struct SceneShelfPresentationTestRunner {
         runTest(testAXReasonPresentationBoundary)
         runTest(testCleanupFailureRefreshBoundary)
         runTest(testPersistenceDiagnosticPresentationBoundary)
+        runTest(testApplicationCatalogPresentationBoundary)
+        runTest(testApplicationCatalogWindowRowsAndPermissionRevocation)
 
         if failures == 0 {
             print("SceneShelfPresentationTestRunner: \(executedTests) tests passed")
@@ -455,6 +457,96 @@ struct SceneShelfPresentationTestRunner {
                 && hosting.fittingSize.height > 0,
             "diagnostic view exposes a renderable reload control boundary"
         )
+    }
+
+    private static func testApplicationCatalogPresentationBoundary() {
+        let window = AXWindowSnapshot(
+            identity: AXWindowIdentity(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Draft",
+                identifier: "draft"
+            ),
+            frame: AXFrame(x: 20, y: 40, width: 900, height: 700),
+            isMinimized: true
+        )
+        let candidate = AXApplicationCandidate(
+            appName: "Text Editor",
+            bundleIdentifier: "com.example.Editor",
+            processID: 701,
+            windows: [window]
+        )
+
+        expect(
+            SceneShelfApplicationCatalogPresentation.inspectButtonIdentifier
+                == "accessibility-inspect-applications",
+            "application catalog exposes a stable inspect button identifier"
+        )
+        expect(
+            SceneShelfApplicationCatalogPresentation.readOnlyNotice.contains("読み取り専用")
+                && SceneShelfApplicationCatalogPresentation.readOnlyNotice.contains("保存・復元には接続していません")
+                && SceneShelfApplicationCatalogPresentation.readOnlyNotice.contains("window title/PID")
+                && SceneShelfApplicationCatalogPresentation.readOnlyNotice.contains("端末内"),
+            "application catalog explicitly states that it is read-only"
+        )
+        let candidateLabel = SceneShelfApplicationCatalogPresentation.candidateLabel(for: candidate)
+        expect(
+            candidateLabel.contains("Text Editor")
+                && candidateLabel.contains("com.example.Editor")
+                && candidateLabel.contains("PID 701"),
+            "candidate label exposes app identity values"
+        )
+        let windowLabel = SceneShelfApplicationCatalogPresentation.windowLabel(for: window)
+        expect(
+            windowLabel.contains("Draft")
+                && windowLabel.contains("draft")
+                && windowLabel.contains("900×700")
+                && windowLabel.contains("最小化"),
+            "window label exposes title, identifier, frame, and minimized state"
+        )
+    }
+
+    private static func testApplicationCatalogWindowRowsAndPermissionRevocation() {
+        let duplicateWindowIdentity = AXWindowIdentity(
+            bundleIdentifier: "com.example.Editor",
+            processID: 702,
+            title: "Untitled",
+            identifier: nil
+        )
+        let duplicateWindows = [
+            AXWindowSnapshot(
+                identity: duplicateWindowIdentity,
+                frame: AXFrame(x: 10, y: 20, width: 640, height: 480),
+                isMinimized: false
+            ),
+            AXWindowSnapshot(
+                identity: duplicateWindowIdentity,
+                frame: AXFrame(x: 30, y: 40, width: 800, height: 600),
+                isMinimized: true
+            )
+        ]
+        let candidate = AXApplicationCandidate(
+            appName: "Text Editor",
+            bundleIdentifier: "com.example.Editor",
+            processID: 702,
+            windows: duplicateWindows
+        )
+        let rows = SceneShelfApplicationCatalogPresentation.windowRows(for: candidate)
+        expect(rows.count == 2, "duplicate window observations remain visible as two rows")
+        expect(Set(rows.map(\.id)).count == 2, "window row IDs include a stable index")
+        expect(rows[0].label != rows[1].label, "duplicate window rows retain distinct value details")
+
+        let granted = SceneShelfApplicationCatalogPresentation.catalogState(
+            permission: .granted,
+            result: .success([candidate])
+        )
+        expect(granted.candidates == [candidate], "granted catalog state exposes candidates")
+        let revoked = SceneShelfApplicationCatalogPresentation.catalogState(
+            permission: .denied,
+            result: nil
+        )
+        expect(revoked.candidates.isEmpty, "permission revocation clears catalog candidates")
+        expect(revoked.message.contains("権限が取り消された"), "revocation message names permission cancellation")
     }
 
     private static func sendClick(to window: NSWindow, at point: NSPoint) {
