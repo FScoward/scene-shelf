@@ -846,6 +846,9 @@ struct ShelfView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .sceneShelfGlassSurface(.header)
 
             if viewModel.cards.isEmpty {
                 Text("シーンがありません")
@@ -874,7 +877,7 @@ struct ShelfView: View {
                         .padding(.horizontal, 12)
                         .padding(.vertical, 10)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(.quaternary.opacity(0.7), in: RoundedRectangle(cornerRadius: 9))
+                        .sceneShelfGlassSurface(.card)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("\(card.name)・\(card.state.japaneseLabel)")
@@ -937,6 +940,7 @@ struct ShelfView: View {
                                             .foregroundStyle(.tertiary)
                                     }
                                 }
+                                .sceneShelfGlassSurface(.card)
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel("\(card.name)・\(card.state.japaneseLabel)")
@@ -977,7 +981,6 @@ struct ShelfView: View {
                             .accessibilityIdentifier("saved-scene-menu-\(card.id)")
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(.quaternary.opacity(0.7), in: RoundedRectangle(cornerRadius: 9))
                     }
                 }
             }
@@ -1013,6 +1016,7 @@ struct ShelfView: View {
                     Button("アプリ候補を確認") {
                         viewModel.inspectApplicationCandidates()
                     }
+                    .sceneShelfGlassPrimaryButtonStyle()
                     .accessibilityLabel("読み取り専用のアプリ候補を確認")
                     .accessibilityIdentifier(
                         SceneShelfApplicationCatalogPresentation.inspectButtonIdentifier
@@ -1116,6 +1120,7 @@ struct ShelfView: View {
                                 viewModel.accessibilityStatus.state != .granted
                                     || viewModel.selectedApplicationWindowIDs.isEmpty
                             )
+                            .sceneShelfGlassPrimaryButtonStyle()
                             .accessibilityLabel("選択したアプリウィンドウの配置を保存")
                             .accessibilityIdentifier(
                                 SceneShelfApplicationCatalogPresentation.saveButtonIdentifier
@@ -1170,6 +1175,7 @@ struct ShelfView: View {
                         viewModel.accessibilityStatus.state != .granted
                             || viewModel.fixtureWindows.isEmpty
                     )
+                    .sceneShelfGlassPrimaryButtonStyle()
                     .accessibilityLabel("検出したFixtureだけを安全に操作")
                     .accessibilityIdentifier("accessibility-operate-fixture")
 
@@ -1206,6 +1212,7 @@ struct ShelfView: View {
                                 || viewModel.selectedFixtureIDs.isEmpty
                                 || viewModel.fixtureWindows.isEmpty
                         )
+                        .sceneShelfGlassPrimaryButtonStyle()
                         .accessibilityLabel("選択したFixtureの現在の配置を保存")
                         .accessibilityIdentifier("fixture-save-scene")
                     }

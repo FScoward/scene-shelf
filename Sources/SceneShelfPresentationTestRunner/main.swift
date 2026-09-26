@@ -78,6 +78,7 @@ struct SceneShelfPresentationTestRunner {
         runTest(testFailureMessageFormat)
         runTest(testLongContentLayout)
         runTest(testShelfViewportBackgroundIsOpaque)
+        runTest(testLiquidGlassSurfaceAndPolicy)
         runTest(testPanelScrollOperation)
         runTest(testShelfActivation)
         runTest(testPrimaryCardHitArea)
@@ -258,6 +259,78 @@ struct SceneShelfPresentationTestRunner {
             !colorsMatch(aquaColor, darkColor),
             "appearance changes update the viewport background layer color"
         )
+    }
+
+    private static func testLiquidGlassSurfaceAndPolicy() {
+        expect(
+            SceneShelfGlassPresentation.policy(
+                for: OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0)
+            ) == .nativeGlass,
+            "macOS 26 selects native glass presentation"
+        )
+        expect(
+            SceneShelfGlassPresentation.policy(
+                for: OperatingSystemVersion(majorVersion: 25, minorVersion: 0, patchVersion: 0)
+            ) == .materialFallback,
+            "pre-macOS 26 keeps the material fallback"
+        )
+
+        let expectedCurrentPolicy: SceneShelfGlassPolicy
+        if #available(macOS 26.0, *) {
+            expectedCurrentPolicy = .nativeGlass
+        } else {
+            expectedCurrentPolicy = .materialFallback
+        }
+        expect(
+            SceneShelfGlassPresentation.currentPolicy == expectedCurrentPolicy,
+            "current OS selects the matching glass presentation policy"
+        )
+
+        var activations = 0
+        let hosting = NSHostingView(
+            rootView: VStack(alignment: .leading, spacing: 8) {
+                Text("Scene Shelf")
+                    .frame(width: 240, height: 24, alignment: .leading)
+                    .sceneShelfGlassSurface(.header)
+                Button {
+                    activations += 1
+                } label: {
+                    SceneShelfCardPrimaryLabel {
+                        Text("Card")
+                    }
+                    .frame(width: 180, height: 44, alignment: .leading)
+                    .sceneShelfGlassSurface(.card)
+                }
+                .buttonStyle(.plain)
+            }
+            .frame(width: 260, height: 100, alignment: .topLeading)
+        )
+        let expectedSize = CGSize(width: 260, height: 100)
+        hosting.frame = NSRect(origin: .zero, size: expectedSize)
+        hosting.layoutSubtreeIfNeeded()
+
+        expect(
+            hosting.frame.size == expectedSize,
+            "glass header and card preserve the fixed layout size"
+        )
+
+        let window = HitRecordingWindow(
+            contentRect: NSRect(origin: .zero, size: expectedSize),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.makeKeyAndOrderFront(nil)
+        window.displayIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        sendClick(to: window, at: NSPoint(x: 80, y: 58))
+
+        expect(
+            activations == 1,
+            "glass card keeps its click action"
+        )
+        window.orderOut(nil)
     }
 
     private static func testPanelScrollOperation() {
