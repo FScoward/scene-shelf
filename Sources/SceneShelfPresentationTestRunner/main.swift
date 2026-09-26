@@ -84,6 +84,8 @@ struct SceneShelfPresentationTestRunner {
         }
         runTest(testPanelHighContrastAppearance)
         runTest(testFailureMessageFormat)
+        runTest(testSavedScenePreviewNormalization)
+        runTest(testSavedScenePreviewCollectionIsKeyedBySceneID)
         runTest(testLongContentLayout)
         runTest(testShelfViewportMaterialSurface)
         runTest(testShelfRootClipSurface)
@@ -93,6 +95,7 @@ struct SceneShelfPresentationTestRunner {
         runTest(testPanelScrollOperation)
         runTest(testShelfActivation)
         runTest(testPrimaryCardHitArea)
+        runTest(testStageManagerPreviewCardBoundary)
         runTest(testAXReasonPresentationBoundary)
         runTest(testCleanupFailureRefreshBoundary)
         runTest(testPersistenceDiagnosticPresentationBoundary)
@@ -182,6 +185,134 @@ struct SceneShelfPresentationTestRunner {
         expect(
             documentHeight > contentHeight,
             "long shelf content is taller than its scroll viewport"
+        )
+    }
+
+    private static func testSavedScenePreviewNormalization() {
+        let mainIdentity = SceneWindowIdentity(
+            bundleIdentifier: "com.example.editor",
+            processID: 701,
+            title: "Main",
+            identifier: "main"
+        )
+        let secondaryIdentity = SceneWindowIdentity(
+            bundleIdentifier: "com.example.editor",
+            processID: 701,
+            title: "Secondary",
+            identifier: "secondary"
+        )
+        let empty = SceneShelfPreviewPresentation.preview(
+            for: SavedScene(id: "empty", name: "空", windows: [])
+        )
+        expect(empty.windows.isEmpty, "empty saved scene produces an empty preview")
+
+        let single = SceneShelfPreviewPresentation.preview(
+            for: SavedScene(
+                id: "single",
+                name: "単一",
+                windows: [
+                    SceneWindowSnapshot(
+                        identity: mainIdentity,
+                        frame: SceneFrame(x: 120, y: 140, width: 800, height: 600),
+                        isMinimized: false
+                    )
+                ]
+            )
+        )
+        expect(
+            single.windows.first?.frame == SceneShelfPreviewFrame(x: 0, y: 0, width: 1, height: 1),
+            "single window fills the normalized preview union"
+        )
+
+        let multiple = SceneShelfPreviewPresentation.preview(
+            for: SavedScene(
+                id: "multiple",
+                name: "複数",
+                windows: [
+                    SceneWindowSnapshot(
+                        identity: mainIdentity,
+                        frame: SceneFrame(x: -100, y: -50, width: 300, height: 200),
+                        isMinimized: false
+                    ),
+                    SceneWindowSnapshot(
+                        identity: secondaryIdentity,
+                        frame: SceneFrame(x: 300, y: 150, width: 100, height: 100),
+                        isMinimized: false
+                    )
+                ]
+            )
+        )
+        expect(
+            multiple.windows.map(\.frame) == [
+                SceneShelfPreviewFrame(x: 0, y: 0, width: 0.6, height: 2.0 / 3.0),
+                SceneShelfPreviewFrame(x: 0.8, y: 2.0 / 3.0, width: 0.2, height: 1.0 / 3.0)
+            ],
+            "multiple windows use one union basis including negative coordinates"
+        )
+        let aspectPreview = SceneShelfPreviewPresentation.preview(
+            for: SavedScene(
+                id: "aspect",
+                name: "比率",
+                windows: [
+                    SceneWindowSnapshot(
+                        identity: mainIdentity,
+                        frame: SceneFrame(x: 0, y: 0, width: 300, height: 200),
+                        isMinimized: false
+                    )
+                ]
+            )
+        )
+        let aspectFit = SceneShelfPreviewPresentation.contentRect(
+            for: aspectPreview,
+            in: CGSize(width: 100, height: 70)
+        )
+        expect(
+            abs(aspectFit.width / aspectFit.height - 1.5) < 0.0001,
+            "thumbnail aspect-fit preserves a 300x200 window ratio"
+        )
+
+        let zeroSize = SceneShelfPreviewPresentation.preview(
+            for: SavedScene(
+                id: "zero",
+                name: "ゼロ",
+                windows: [
+                    SceneWindowSnapshot(
+                        identity: mainIdentity,
+                        frame: SceneFrame(x: 20, y: 30, width: 0, height: 0),
+                        isMinimized: false
+                    )
+                ]
+            )
+        )
+        expect(
+            zeroSize.windows.allSatisfy { $0.frame.isFinite && $0.frame.isUnitRange },
+            "zero-size windows produce finite normalized bounds"
+        )
+    }
+
+    private static func testSavedScenePreviewCollectionIsKeyedBySceneID() {
+        let window = SceneWindowSnapshot(
+            identity: SceneWindowIdentity(
+                bundleIdentifier: "com.example.editor",
+                processID: 702,
+                title: "Main",
+                identifier: "main"
+            ),
+            frame: SceneFrame(x: 0, y: 0, width: 200, height: 100),
+            isMinimized: false
+        )
+        let scenes = [
+            SavedScene(id: "scene-a", name: "A", windows: [window]),
+            SavedScene(id: "scene-b", name: "B", windows: [])
+        ]
+        let previews = SceneShelfPreviewPresentation.previews(for: scenes)
+        expect(
+            Set(previews.keys) == Set(["scene-a", "scene-b"]),
+            "preview collection publishes one entry per saved scene ID"
+        )
+        expect(
+            previews["scene-a"]?.windows.count == 1 && previews["scene-b"]?.windows.isEmpty == true,
+            "preview collection preserves each scene's window contents"
         )
     }
 
@@ -674,6 +805,42 @@ struct SceneShelfPresentationTestRunner {
             "saved scene management menu click does not invoke the primary action"
         )
         window.orderOut(nil)
+    }
+
+    private static func testStageManagerPreviewCardBoundary() {
+        let preview = SceneShelfPreviewPresentation.preview(
+            for: SavedScene(id: "scene-card", name: "検証A", windows: [])
+        )
+        let hosting = NSHostingView(
+            rootView: HStack(spacing: 4) {
+                Button {} label: {
+                    SceneShelfCardPrimaryLabel {
+                        HStack(spacing: 10) {
+                            SceneShelfPreviewThumbnail(preview: preview)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("検証A")
+                                Text(SceneState.stashed.japaneseLabel)
+                            }
+                            Spacer()
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                Menu { Button("管理") {} } label: {
+                    Image(systemName: "ellipsis")
+                        .frame(width: 28, height: 28)
+                }
+                .menuStyle(.borderlessButton)
+            }
+            .frame(width: 300, height: 76, alignment: .leading)
+        )
+        hosting.frame = NSRect(x: 0, y: 0, width: 300, height: 76)
+        hosting.layoutSubtreeIfNeeded()
+
+        let primaryHit = hosting.hitTest(NSPoint(x: 220, y: 38))
+        let menuHit = hosting.hitTest(NSPoint(x: 285, y: 38))
+        expect(primaryHit != nil, "preview card keeps the primary whitespace clickable")
+        expect(menuHit != nil, "preview card keeps an independent ellipsis hit area")
     }
 
     private static func testAXReasonPresentationBoundary() {

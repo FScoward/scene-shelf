@@ -46,6 +46,7 @@ final class ShelfViewModel: ObservableObject {
 
     @Published private(set) var cards: [SceneCardSnapshot] = []
     @Published private(set) var savedCards: [SceneCardSnapshot] = []
+    @Published private(set) var savedScenePreviews: [SceneID: SceneShelfPreview] = [:]
     @Published private(set) var savedCardFailureMessages: [SceneID: String] = [:]
     @Published private(set) var persistenceDiagnosticRows: [SceneShelfPersistenceDiagnosticRow] = []
     @Published private(set) var statusMessage = "クリックでシーンを切り替えます"
@@ -181,7 +182,9 @@ final class ShelfViewModel: ObservableObject {
     func refresh() async {
         let snapshot = await coordinator.snapshot()
         cards = snapshot.cards
+        let scenes = await sceneStore.scenes()
         savedCards = await sceneStore.cards()
+        savedScenePreviews = SceneShelfPreviewPresentation.previews(for: scenes)
     }
 
     func click(sceneID: SceneID) {
@@ -915,6 +918,7 @@ private extension SceneCaptureError {
 
 struct ShelfView: View {
     @ObservedObject var viewModel: ShelfViewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         ShelfScrollContainer {
@@ -999,9 +1003,12 @@ struct ShelfView: View {
                                 viewModel.click(sceneID: card.id)
                             } label: {
                                 SceneShelfCardPrimaryLabel {
-                                    HStack(spacing: 10) {
-                                        Image(systemName: card.state == .displayed ? "rectangle.inset.filled" : "rectangle")
-                                            .frame(width: 18)
+                                    HStack(spacing: 12) {
+                                        SceneShelfPreviewThumbnail(
+                                            preview: viewModel.savedScenePreviews[card.id]
+                                                ?? SceneShelfPreview(sceneID: card.id, windows: []),
+                                            isDisplayed: card.state == .displayed
+                                        )
                                         VStack(alignment: .leading, spacing: 3) {
                                             Text(card.name)
                                                 .font(.body.weight(.medium))
@@ -1016,12 +1023,26 @@ struct ShelfView: View {
                                             }
                                         }
                                         Spacer()
-                                        Image(systemName: "chevron.right")
+                                        Image(systemName: card.state == .displayed
+                                            ? "checkmark.circle.fill"
+                                            : "chevron.right")
                                             .font(.caption.weight(.semibold))
-                                            .foregroundStyle(.tertiary)
+                                            .foregroundStyle(card.state == .displayed
+                                                ? Color.accentColor
+                                                : Color.secondary)
                                     }
                                 }
                                 .sceneShelfGlassSurface(.card)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .stroke(
+                                            card.state == .displayed
+                                                ? Color.accentColor.opacity(0.9)
+                                                : .clear,
+                                            lineWidth: card.state == .displayed ? 1.5 : 0
+                                        )
+                                        .allowsHitTesting(false)
+                                )
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel("\(card.name)・\(card.state.japaneseLabel)")
@@ -1062,6 +1083,10 @@ struct ShelfView: View {
                             .accessibilityIdentifier("saved-scene-menu-\(card.id)")
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .animation(
+                            reduceMotion ? nil : .easeInOut(duration: 0.18),
+                            value: card.state
+                        )
                     }
                 }
             }
