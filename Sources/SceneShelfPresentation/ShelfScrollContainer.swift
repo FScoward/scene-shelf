@@ -4,27 +4,28 @@ import SwiftUI
 public enum SceneShelfLayout {
     public static let viewportWidth: CGFloat = 360
     public static let viewportHeight: CGFloat = 620
+    public static let viewportCornerRadius: CGFloat = 14
     public static let viewportSize = CGSize(width: viewportWidth, height: viewportHeight)
 }
 
-private final class ShelfViewportBackgroundNSView: NSView {
-    override var isOpaque: Bool { true }
-
+private final class ShelfViewportBackgroundNSView: NSVisualEffectView {
     override func hitTest(_ point: NSPoint) -> NSView? {
         nil
     }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        applySystemBackground()
+        applyMaterial()
     }
 
-    func applySystemBackground() {
+    func applyMaterial() {
+        material = .sidebar
+        blendingMode = .behindWindow
+        state = .active
         wantsLayer = true
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        }
-        layer?.isOpaque = true
+        layer?.cornerRadius = SceneShelfLayout.viewportCornerRadius
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
     }
 }
 
@@ -36,12 +37,12 @@ private struct ShelfViewportBackground: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = ShelfViewportBackgroundNSView()
         view.identifier = NSUserInterfaceItemIdentifier(Self.identifier)
-        view.applySystemBackground()
+        view.applyMaterial()
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        (nsView as? ShelfViewportBackgroundNSView)?.applySystemBackground()
+        (nsView as? ShelfViewportBackgroundNSView)?.applyMaterial()
     }
 }
 
@@ -75,6 +76,11 @@ public struct ShelfScrollContainer<Content: View>: View {
             height: SceneShelfLayout.viewportHeight,
             alignment: .topLeading
         )
-        .clipped()
+        .clipShape(
+            RoundedRectangle(
+                cornerRadius: SceneShelfLayout.viewportCornerRadius,
+                style: .continuous
+            )
+        )
     }
 }

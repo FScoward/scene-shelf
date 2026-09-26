@@ -77,7 +77,9 @@ struct SceneShelfPresentationTestRunner {
         }
         runTest(testFailureMessageFormat)
         runTest(testLongContentLayout)
-        runTest(testShelfViewportBackgroundIsOpaque)
+        runTest(testShelfViewportMaterialSurface)
+        runTest(testShelfRootClipSurface)
+        runTest(testReadableContentSurfacePresentation)
         runTest(testLiquidGlassSurfaceAndPolicy)
         runTest(testPanelScrollOperation)
         runTest(testShelfActivation)
@@ -174,7 +176,7 @@ struct SceneShelfPresentationTestRunner {
         )
     }
 
-    private static func testShelfViewportBackgroundIsOpaque() {
+    private static func testShelfViewportMaterialSurface() {
         let hosting = NSHostingView(
             rootView: ShelfScrollContainer {
                 Color.clear
@@ -202,62 +204,75 @@ struct SceneShelfPresentationTestRunner {
 
         guard let background = descendants(of: hosting).first(where: {
             $0.identifier?.rawValue == "scene-shelf-viewport-background"
-        }) else {
-            expect(false, "shelf viewport renders a discoverable background view")
+        }) as? NSVisualEffectView else {
+            expect(false, "shelf viewport renders a discoverable visual effect view")
             return
         }
 
-        let alpha = background.layer?.backgroundColor?.components?.last ?? 0
         expect(
             background.frame.width >= SceneShelfLayout.viewportWidth
                 && background.frame.height >= SceneShelfLayout.viewportHeight,
-            "shelf viewport background covers the full fixed viewport"
+            "shelf viewport material covers the full fixed viewport"
         )
         expect(
-            background.isOpaque && background.layer?.isOpaque == true && alpha == 1,
-            "shelf viewport background is fully opaque"
+            background.material == .sidebar
+                && background.blendingMode == .behindWindow
+                && background.state == .active,
+            "shelf viewport uses active behind-window sidebar material"
         )
         expect(
             !panel.isOpaque && panel.backgroundColor?.isEqual(NSColor.clear) == true,
-            "transparent shelf panel does not remove the viewport background"
+            "transparent shelf panel keeps the viewport material visible"
         )
         expect(
             background.hitTest(NSPoint(x: 10, y: 10)) == nil,
-            "shelf viewport background does not intercept clicks"
+            "shelf viewport material does not intercept clicks"
         )
+        expect(
+            background.layer?.cornerCurve == .continuous
+                && background.layer?.masksToBounds == true,
+            "shelf viewport material clips to a continuous rounded outer edge"
+        )
+    }
 
-        guard let aquaAppearance = NSAppearance(named: .aqua),
-            let darkAppearance = NSAppearance(named: .darkAqua) else {
-            expect(false, "aqua and darkAqua appearances are available")
+    private static func testShelfRootClipSurface() {
+        let hosting = NSHostingView(
+            rootView: ShelfScrollContainer {
+                Color.red
+                    .frame(
+                        width: SceneShelfLayout.viewportWidth,
+                        height: SceneShelfLayout.viewportHeight
+                    )
+            }
+        )
+        hosting.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: SceneShelfLayout.viewportWidth,
+            height: SceneShelfLayout.viewportHeight
+        )
+        let panel = NSPanel(
+            contentRect: NSRect(origin: .zero, size: SceneShelfLayout.viewportSize),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.contentView = hosting
+        panel.contentView?.layoutSubtreeIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        panel.displayIfNeeded()
+
+        guard let bitmap = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else {
+            expect(false, "shelf root exposes a rendered bitmap for clip observation")
             return
         }
-
-        panel.appearance = aquaAppearance
-        panel.contentView?.layoutSubtreeIfNeeded()
-        hosting.layoutSubtreeIfNeeded()
-        let aquaColor = background.layer?.backgroundColor
+        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+        let cornerAlpha = bitmap.colorAt(x: 0, y: 0)?.alphaComponent ?? 1
         expect(
-            colorsMatch(
-                aquaColor,
-                windowBackgroundColor(for: aquaAppearance)
-            ),
-            "aqua appearance uses the system window background color"
-        )
-
-        panel.appearance = darkAppearance
-        panel.contentView?.layoutSubtreeIfNeeded()
-        hosting.layoutSubtreeIfNeeded()
-        let darkColor = background.layer?.backgroundColor
-        expect(
-            colorsMatch(
-                darkColor,
-                windowBackgroundColor(for: darkAppearance)
-            ),
-            "darkAqua appearance uses the system window background color"
-        )
-        expect(
-            !colorsMatch(aquaColor, darkColor),
-            "appearance changes update the viewport background layer color"
+            cornerAlpha < 0.2,
+            "shelf root clips rendered scroll content to a continuous rounded boundary"
         )
     }
 
@@ -329,6 +344,62 @@ struct SceneShelfPresentationTestRunner {
         expect(
             activations == 1,
             "glass card keeps its click action"
+        )
+        window.orderOut(nil)
+    }
+
+    private static func testReadableContentSurfacePresentation() {
+        expect(
+            SceneShelfReadableContentSurfacePresentation.backgroundOpacity(
+                reduceTransparency: false
+            ) == 0.88,
+            "readable content surface keeps a translucent system background by default"
+        )
+        expect(
+            SceneShelfReadableContentSurfacePresentation.backgroundOpacity(
+                reduceTransparency: true
+            ) == 1.0,
+            "readable content surface becomes opaque when transparency is reduced"
+        )
+
+        var activations = 0
+        let hosting = NSHostingView(
+            rootView: GroupBox {
+                Button {
+                    activations += 1
+                } label: {
+                    SceneShelfCardPrimaryLabel {
+                        Text("Readable")
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+            .sceneShelfReadableContentSurface()
+            .accessibilityIdentifier("application-catalog-read-only")
+            .frame(width: 240, height: 72, alignment: .topLeading)
+        )
+        let expectedSize = CGSize(width: 240, height: 72)
+        hosting.frame = NSRect(origin: .zero, size: expectedSize)
+        hosting.layoutSubtreeIfNeeded()
+        expect(
+            hosting.frame.size == expectedSize,
+            "readable content surface preserves its fixed layout"
+        )
+
+        let window = HitRecordingWindow(
+            contentRect: NSRect(origin: .zero, size: expectedSize),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.makeKeyAndOrderFront(nil)
+        window.displayIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        sendClick(to: window, at: NSPoint(x: 80, y: 30))
+        expect(
+            activations == 1,
+            "readable content surface preserves the embedded click action"
         )
         window.orderOut(nil)
     }
@@ -796,26 +867,6 @@ struct SceneShelfPresentationTestRunner {
 
     private static func descendants(of view: NSView) -> [NSView] {
         view.subviews + view.subviews.flatMap(descendants(of:))
-    }
-
-    private static func colorsMatch(_ lhs: CGColor?, _ rhs: CGColor?) -> Bool {
-        guard let lhs, let rhs,
-            lhs.numberOfComponents == rhs.numberOfComponents,
-            let lhsComponents = lhs.components,
-            let rhsComponents = rhs.components else {
-            return false
-        }
-        return zip(lhsComponents, rhsComponents).allSatisfy {
-            abs($0 - $1) < 0.0001
-        }
-    }
-
-    private static func windowBackgroundColor(for appearance: NSAppearance) -> CGColor? {
-        var color: CGColor?
-        appearance.performAsCurrentDrawingAppearance {
-            color = NSColor.windowBackgroundColor.cgColor
-        }
-        return color
     }
 
     private static func expect(_ condition: @autoclosure () -> Bool, _ message: String) {

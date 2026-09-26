@@ -1130,6 +1130,7 @@ struct ShelfView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .sceneShelfReadableContentSurface()
             .accessibilityIdentifier("application-catalog-read-only")
 
             Divider()
@@ -1229,6 +1230,7 @@ struct ShelfView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .sceneShelfReadableContentSurface()
             .accessibilityIdentifier("accessibility-verification")
             }
             .padding(16)
