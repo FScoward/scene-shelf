@@ -1,0 +1,6 @@
+.build/
+.build-*/
+.build-spm-*/
+DerivedData/
+.DS_Store
+.claude/tmp/
