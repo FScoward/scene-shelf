@@ -13,6 +13,7 @@ public enum SceneManagementError: Error, Equatable, Sendable {
     case sceneActive(SceneID)
     case orderBoundary
     case targetUnavailable(SceneFailureReason)
+    case applicationOverwriteUnsupported
     case cleanupFailed(SceneID)
 
     public var japaneseLabel: String {
@@ -31,6 +32,8 @@ public enum SceneManagementError: Error, Equatable, Sendable {
             return "これ以上移動できません"
         case let .targetUnavailable(reason):
             return "現在の配置を取得できません: \(reason.japaneseLabel)"
+        case .applicationOverwriteUnsupported:
+            return "一般アプリ配置の上書きは未対応です。保存内容は変更しません"
         case let .cleanupFailed(sceneID):
             return "配置 \(sceneID) の旧保存ファイルを削除できませんでした。配置の削除は反映済みです"
         }

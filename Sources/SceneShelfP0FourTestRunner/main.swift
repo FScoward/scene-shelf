@@ -23,7 +23,7 @@ struct SceneShelfP0FourTestRunner {
 
         await run("ambiguous same-title candidates produce zero write instructions") {
             let main = fixtureWindow(id: "main", processID: 101)
-            let duplicate = fixtureWindow(id: "main", processID: 202)
+            let duplicate = fixtureWindow(id: "main", processID: 101)
             let scene = SavedScene(id: "scene-ambiguous", name: "曖昧", windows: [main])
             let plan = SceneRestorePlanner.plan(
                 for: scene,
@@ -79,7 +79,7 @@ struct SceneShelfP0FourTestRunner {
 
         await run("all failures produce Failed state and clear currentSceneID") {
             let saved = fixtureWindow(id: "main", processID: 101)
-            let duplicate = fixtureWindow(id: "main", processID: 202)
+            let duplicate = fixtureWindow(id: "main", processID: 101)
             let store = InMemorySceneStore()
             do {
                 let scene = try await store.save(

@@ -25,6 +25,8 @@ final class ShelfViewModel: ObservableObject {
     )
     @Published private(set) var applicationCandidates: [AXApplicationCandidate] = []
     @Published private(set) var applicationCatalogMessage = "アプリ候補はまだ確認していません"
+    @Published private(set) var selectedApplicationWindowIDs: Set<AXWindowIdentity> = []
+    @Published var applicationCaptureName = "アプリ配置"
     @Published private(set) var fixtureWindows: [AXWindowSnapshot] = []
     @Published private(set) var selectedFixtureIDs: Set<AXWindowIdentity> = []
     @Published var captureName = SceneCaptureFlow.defaultName
@@ -282,6 +284,18 @@ final class ShelfViewModel: ObservableObject {
         let adapter = accessibilityAdapter
         let store = sceneStore
         Task { @MainActor [weak self] in
+            guard let scene = await store.scene(sceneID: sceneID) else {
+                guard let self else { return }
+                sceneManagementMessage = SceneManagementError.sceneNotFound(sceneID).japaneseLabel
+                return
+            }
+            guard scene.windows.allSatisfy({
+                $0.identity.bundleIdentifier == SceneMatcher.fixtureBundleIdentifier
+            }) else {
+                guard let self else { return }
+                sceneManagementMessage = SceneManagementError.applicationOverwriteUnsupported.japaneseLabel
+                return
+            }
             let discovery = await adapter.fixtureWindowResult()
             if let failureReason = discovery.failureReason {
                 guard let self else { return }
@@ -381,6 +395,11 @@ final class ShelfViewModel: ObservableObject {
                 result: nil
             )
             applicationCandidates = catalogState.candidates
+            selectedApplicationWindowIDs =
+                SceneShelfApplicationCatalogPresentation.selectedWindowIDs(
+                    existing: selectedApplicationWindowIDs,
+                    from: catalogState
+                )
             applicationCatalogMessage = catalogState.message
         } else {
             accessibilityMessage = "許可済みです。対象Fixtureだけを検証できます"
@@ -422,8 +441,8 @@ final class ShelfViewModel: ObservableObject {
         }
     }
 
-    /// Reads general application candidates without exposing a write action.
-    /// Fixture save/restore remains on its existing explicit controls.
+    /// Reads general application candidates without writing. Explicitly
+    /// selected rows are handled by the separate save action below.
     func inspectApplicationCandidates() {
         let adapter = accessibilityAdapter
         Task { @MainActor [weak self] in
@@ -434,6 +453,11 @@ final class ShelfViewModel: ObservableObject {
                     result: nil
                 )
                 applicationCandidates = catalogState.candidates
+                selectedApplicationWindowIDs =
+                    SceneShelfApplicationCatalogPresentation.selectedWindowIDs(
+                        existing: selectedApplicationWindowIDs,
+                        from: catalogState
+                    )
                 applicationCatalogMessage = catalogState.message
                 return
             }
@@ -443,7 +467,103 @@ final class ShelfViewModel: ObservableObject {
                 result: result
             )
             applicationCandidates = catalogState.candidates
+            selectedApplicationWindowIDs =
+                SceneShelfApplicationCatalogPresentation.selectedWindowIDs(
+                    existing: selectedApplicationWindowIDs,
+                    from: catalogState
+                )
             applicationCatalogMessage = catalogState.message
+        }
+    }
+
+    func setApplicationSelection(_ identity: AXWindowIdentity, isSelected: Bool) {
+        let selectableWindowIDs = Set(
+            applicationCandidates.flatMap { candidate in
+                SceneShelfApplicationCatalogPresentation.selectableWindowIDs(from: candidate)
+            }
+        )
+        guard selectableWindowIDs.contains(identity) else {
+            selectedApplicationWindowIDs.remove(identity)
+            return
+        }
+        if isSelected {
+            selectedApplicationWindowIDs.insert(identity)
+        } else {
+            selectedApplicationWindowIDs.remove(identity)
+        }
+    }
+
+    func saveApplicationScene() {
+        guard accessibilityStatus.state == .granted else {
+            let catalogState = SceneShelfApplicationCatalogPresentation.catalogState(
+                permission: accessibilityStatus.state,
+                result: nil
+            )
+            applicationCandidates = catalogState.candidates
+            selectedApplicationWindowIDs =
+                SceneShelfApplicationCatalogPresentation.selectedWindowIDs(
+                    existing: selectedApplicationWindowIDs,
+                    from: catalogState
+                )
+            applicationCatalogMessage = catalogState.message
+            return
+        }
+        guard !selectedApplicationWindowIDs.isEmpty else {
+            applicationCatalogMessage = "保存対象を1件以上選択してください"
+            return
+        }
+
+        let selectedIDs = selectedApplicationWindowIDs
+        let name = applicationCaptureName
+        let store = sceneStore
+        let adapter = accessibilityAdapter
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await adapter.applicationCatalog()
+            let catalogState = SceneShelfApplicationCatalogPresentation.catalogState(
+                permission: accessibilityStatus.state,
+                result: result
+            )
+            guard result.failureReason == nil else {
+                applicationCandidates = catalogState.candidates
+                selectedApplicationWindowIDs =
+                    SceneShelfApplicationCatalogPresentation.selectedWindowIDs(
+                        existing: selectedApplicationWindowIDs,
+                        from: catalogState
+                    )
+                applicationCatalogMessage = catalogState.message
+                return
+            }
+
+            do {
+                let candidates = catalogState.candidates.flatMap(\.windows)
+                let preparation = try AXSceneCapturePreparation.prepare(
+                    candidates: candidates,
+                    selectedIDs: selectedIDs
+                )
+                let sceneCandidates = preparation.selectedCandidates.compactMap(Self.sceneSnapshot(from:))
+                let selected = Set(
+                    preparation.selectedIDs.map { SceneWindowIdentity(from: $0) }
+                )
+                _ = try await store.save(
+                    name: name,
+                    candidates: sceneCandidates,
+                    selectedIDs: selected
+                )
+                selectedApplicationWindowIDs = []
+                applicationCatalogMessage = "選択したアプリ配置をローカルに保存しました"
+                await refresh()
+            } catch let error as AXSceneCaptureError {
+                applicationCatalogMessage = SceneShelfAXPresentation.saveFailureMessage(for: error)
+            } catch let error as SceneCaptureError {
+                applicationCatalogMessage = error.japaneseLabel
+            } catch let error as ScenePersistenceError {
+                applicationCatalogMessage = error.japaneseLabel
+            } catch let error as SceneManagementError {
+                applicationCatalogMessage = SceneShelfManagementPresentation.message(for: error)
+            } catch {
+                applicationCatalogMessage = "アプリ配置を保存できませんでした"
+            }
         }
     }
 
@@ -488,18 +608,21 @@ final class ShelfViewModel: ObservableObject {
             statusMessage = "保存済み配置を操作中です"
             let operationTask = Task {
                 await store.clickDetailed(sceneID: sceneID) { basePlan in
-                    let discovery = await adapter.fixtureWindowResult()
-                    if let failureReason = discovery.failureReason {
-                        return SceneShelfAXPresentation.restoreReport(
-                            for: basePlan,
-                            discoveryFailure: failureReason
+                    let plan = await Self.prepareRestorePlan(
+                        basePlan,
+                        adapter: adapter
+                    )
+                    let authorizationScope = AXAuthorizationScope(
+                        allowedTargets: Set(
+                            basePlan.instructions.map { Self.axIdentity(from: $0.target) }
                         )
-                    }
-                    let candidates = discovery.windows.compactMap(Self.sceneSnapshot(from:))
-                    let plan = SceneRestorePlanner.resolve(plan: basePlan, candidates: candidates)
+                    )
                     var executedOutcomes: [SceneTargetRestoreOutcome] = []
                     for instruction in plan.instructions {
-                        let request = Self.axRequest(from: instruction)
+                        let request = Self.axRequest(
+                            from: instruction,
+                            authorizationScope: authorizationScope
+                        )
                         let report = await adapter.perform(request)
                         let appliedOperations = report.appliedOperations.compactMap {
                             SceneWindowOperation(rawValue: $0.rawValue)
@@ -610,11 +733,65 @@ final class ShelfViewModel: ObservableObject {
         )
     }
 
-    nonisolated private static func axRequest(from instruction: SceneRestoreInstruction) -> AXOperationRequest {
+    nonisolated private static func axRequest(
+        from instruction: SceneRestoreInstruction,
+        authorizationScope: AXAuthorizationScope? = nil
+    ) -> AXOperationRequest {
         AXOperationRequest(
             target: axIdentity(from: instruction.target),
             frame: instruction.frame.map(AXFrame.init(from:)),
-            operations: instruction.operations.compactMap { AXOperation(rawValue: $0.rawValue) }
+            operations: instruction.operations.compactMap { AXOperation(rawValue: $0.rawValue) },
+            authorizationScope: authorizationScope
+        )
+    }
+
+    nonisolated private static func prepareRestorePlan(
+        _ basePlan: SceneRestorePlan,
+        adapter: any AXWindowAdapter
+    ) async -> SceneRestorePlan {
+        var candidates: [SceneWindowSnapshot] = []
+        var preflightFailures = basePlan.preflightFailures
+        var skippedTargets = Set<SceneWindowIdentity>()
+        var resolvedApplicationKeys = Set<AXApplicationProcessIdentity>()
+
+        for instruction in basePlan.instructions {
+            let target = axIdentity(from: instruction.target)
+            let applicationKey = AXApplicationProcessIdentity(
+                bundleIdentifier: target.bundleIdentifier,
+                processID: target.processID
+            )
+            guard resolvedApplicationKeys.insert(applicationKey).inserted else {
+                continue
+            }
+
+            let discovery = await adapter.windowResult(for: target)
+            if let failureReason = discovery.failureReason {
+                let sceneReason = SceneFailureReason(rawValue: failureReason.rawValue)
+                    ?? .operationFailed
+                for relatedInstruction in basePlan.instructions where
+                    relatedInstruction.target.bundleIdentifier == instruction.target.bundleIdentifier
+                    && relatedInstruction.target.processID == instruction.target.processID {
+                    skippedTargets.insert(relatedInstruction.target)
+                    preflightFailures.append(
+                        .failed(target: relatedInstruction.target, reason: sceneReason)
+                    )
+                }
+                continue
+            }
+            candidates.append(contentsOf: discovery.windows.compactMap(sceneSnapshot(from:)))
+        }
+
+        let resolvablePlan = SceneRestorePlan(
+            sceneID: basePlan.sceneID,
+            action: basePlan.action,
+            instructions: basePlan.instructions.filter {
+                !skippedTargets.contains($0.target)
+            },
+            preflightFailures: preflightFailures
+        )
+        return SceneRestorePlanner.resolve(
+            plan: resolvablePlan,
+            candidates: candidates
         )
     }
 }
@@ -864,12 +1041,53 @@ struct ShelfView: View {
                                             for: candidate
                                         )
                                     ) { row in
-                                        Text(
-                                            row.label
-                                        )
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .fixedSize(horizontal: false, vertical: true)
+                                        if row.isSelectable {
+                                            Toggle(isOn: Binding(
+                                                get: {
+                                                    viewModel.selectedApplicationWindowIDs.contains(
+                                                        row.window.identity
+                                                    )
+                                                },
+                                                set: {
+                                                    viewModel.setApplicationSelection(
+                                                        row.window.identity,
+                                                        isSelected: $0
+                                                    )
+                                                }
+                                            )) {
+                                                Text(row.label)
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                                    .fixedSize(horizontal: false, vertical: true)
+                                            }
+                                            .toggleStyle(.checkbox)
+                                            .accessibilityLabel(
+                                                SceneShelfApplicationCatalogPresentation.selectionLabel(
+                                                    for: row
+                                                )
+                                            )
+                                            .accessibilityIdentifier(
+                                                "application-selection-\(row.id)"
+                                            )
+                                        } else {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text("一意に識別できないため保存対象にできません")
+                                                    .font(.caption2.weight(.medium))
+                                                    .foregroundStyle(.orange)
+                                                Text(row.label)
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                                    .fixedSize(horizontal: false, vertical: true)
+                                            }
+                                            .accessibilityLabel(
+                                                SceneShelfApplicationCatalogPresentation.selectionLabel(
+                                                    for: row
+                                                )
+                                            )
+                                            .accessibilityIdentifier(
+                                                "application-selection-unavailable-\(row.id)"
+                                            )
+                                        }
                                     }
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -880,6 +1098,29 @@ struct ShelfView: View {
                         .accessibilityIdentifier(
                             SceneShelfApplicationCatalogPresentation.listIdentifier
                         )
+
+                        HStack(spacing: 8) {
+                            TextField(
+                                "アプリ配置名",
+                                text: $viewModel.applicationCaptureName
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityLabel("保存するアプリ配置名")
+                            .accessibilityIdentifier(
+                                SceneShelfApplicationCatalogPresentation.nameFieldIdentifier
+                            )
+                            Button("選択したアプリ配置を保存") {
+                                viewModel.saveApplicationScene()
+                            }
+                            .disabled(
+                                viewModel.accessibilityStatus.state != .granted
+                                    || viewModel.selectedApplicationWindowIDs.isEmpty
+                            )
+                            .accessibilityLabel("選択したアプリウィンドウの配置を保存")
+                            .accessibilityIdentifier(
+                                SceneShelfApplicationCatalogPresentation.saveButtonIdentifier
+                            )
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)

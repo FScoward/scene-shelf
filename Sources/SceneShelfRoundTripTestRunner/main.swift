@@ -25,6 +25,62 @@ struct SceneShelfRoundTripTestRunner {
             }
         }
 
+        await run("generic capture stores the exact selected application allowlist") {
+            let store = InMemorySceneStore()
+            let selected = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let excluded = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Notes",
+                identifier: "notes"
+            )
+            do {
+                let saved = try await store.save(
+                    name: "エディタ配置",
+                    candidates: [selected, excluded],
+                    selectedIDs: [selected.identity]
+                )
+                expect(saved.windows.map(\.identity) == [selected.identity])
+                expect(saved.windows.contains { $0.identity == excluded.identity } == false)
+            } catch {
+                fail("generic selected capture unexpectedly failed: \(error)")
+            }
+        }
+
+        await run("matcher prefers the same PID over another PID with the same hint") {
+            let target = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let samePID = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let otherPID = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 702,
+                title: "Draft",
+                identifier: "draft"
+            )
+            expect(
+                SceneMatcher.resolve(target: target.identity, candidates: [samePID, otherPID])
+                    == .matched(samePID)
+            )
+            expect(
+                SceneMatcher.resolve(target: target.identity, candidates: [otherPID])
+                    == .pidReused
+            )
+        }
+
         await run("empty selection is rejected without storing a scene") {
             let store = InMemorySceneStore()
             do {
@@ -142,6 +198,24 @@ struct SceneShelfRoundTripTestRunner {
                     candidates: [candidateWithIdentifier]
                 ) == .missing
             )
+
+            let genericTarget = SceneWindowIdentity(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let genericCandidate = SceneWindowSnapshot(
+                identity: genericTarget,
+                frame: uniqueNilIdentifier.frame,
+                isMinimized: false
+            )
+            expect(
+                SceneMatcher.resolve(
+                    target: genericTarget,
+                    candidates: [genericCandidate]
+                ) == .matched(genericCandidate)
+            )
         }
 
         await run("display plan restores saved frame after unminimize") {
@@ -232,7 +306,7 @@ struct SceneShelfRoundTripTestRunner {
         }
 
         if failures == 0 {
-            print("SceneShelfRoundTripTestRunner: 10 tests passed")
+            print("SceneShelfRoundTripTestRunner: 12 tests passed")
         } else {
             print("SceneShelfRoundTripTestRunner: \(failures) failures")
             Foundation.exit(1)
@@ -253,6 +327,24 @@ struct SceneShelfRoundTripTestRunner {
             ),
             frame: SceneFrame(x: 120, y: 140, width: 800, height: 600),
             isMinimized: minimized
+        )
+    }
+
+    private static func applicationWindow(
+        bundleIdentifier: String,
+        processID: Int32,
+        title: String,
+        identifier: String?
+    ) -> SceneWindowSnapshot {
+        SceneWindowSnapshot(
+            identity: SceneWindowIdentity(
+                bundleIdentifier: bundleIdentifier,
+                processID: processID,
+                title: title,
+                identifier: identifier
+            ),
+            frame: SceneFrame(x: 120, y: 140, width: 800, height: 600),
+            isMinimized: false
         )
     }
 

@@ -103,6 +103,189 @@ struct SceneShelfAXTestRunner {
             expect(candidate?.windows.first?.isMinimized == true)
         }
 
+        await run("selected application authorization rejects an unselected target") {
+            let selected = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let unselected = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Notes",
+                identifier: "notes"
+            )
+            let scope = AXAuthorizationScope(allowedTargets: [selected.identity])
+            expect(
+                AXAuthorizationPolicy.authorize(
+                    target: selected.identity,
+                    scope: scope
+                ) == .authorized
+            )
+            expect(
+                AXAuthorizationPolicy.authorize(
+                    target: unselected.identity,
+                    scope: scope
+                ) == .targetNotAuthorized
+            )
+        }
+
+        await run("generic application matcher rejects ambiguous nil identifiers") {
+            let first = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Untitled",
+                identifier: nil
+            )
+            let second = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Untitled",
+                identifier: nil,
+                frame: AXFrame(x: 40, y: 50, width: 700, height: 500)
+            )
+            let decision = AXApplicationSafetyPolicy.resolve(
+                target: first.identity,
+                candidates: [first, second]
+            )
+            expect(decision == .ambiguous)
+
+            let adapter = FakeAXAdapter(
+                permission: .granted,
+                windows: [first, second]
+            )
+            let report = await adapter.perform(
+                request(
+                    for: first.identity,
+                    scope: AXAuthorizationScope(allowedTargets: [first.identity])
+                )
+            )
+            expect(report.failureReason == .ambiguousMatch)
+            expect(report.writesPerformed == 0)
+            let writes = await adapter.currentWriteCount()
+            expect(writes == 0)
+        }
+
+        await run("generic application perform resolves each operation and rejects PID reuse") {
+            let target = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let changed = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Renamed",
+                identifier: "draft"
+            )
+            let adapter = FakeAXAdapter(
+                permission: .granted,
+                windows: [target],
+                candidateSequence: [[target], [changed]]
+            )
+            let report = await adapter.perform(
+                AXOperationRequest(
+                    target: target.identity,
+                    frame: AXFrame(x: 120, y: 140, width: 800, height: 600),
+                    operations: [.move, .resize],
+                    authorizationScope: AXAuthorizationScope(
+                        allowedTargets: [target.identity]
+                    )
+                )
+            )
+            expect(report.failureReason == .windowChanged)
+            expect(report.appliedOperations == [.move])
+            expect(report.writesPerformed == 1)
+
+            let pidReused = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 702,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let reusedAdapter = FakeAXAdapter(
+                permission: .granted,
+                windows: [pidReused]
+            )
+            let reusedReport = await reusedAdapter.perform(
+                request(
+                    for: target.identity,
+                    scope: AXAuthorizationScope(allowedTargets: [target.identity])
+                )
+            )
+            expect(reusedReport.failureReason == .pidReused)
+            expect(reusedReport.writesPerformed == 0)
+        }
+
+        await run("generic authorization rejects a wrong target before any write") {
+            let selected = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let wrongTarget = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Notes",
+                identifier: "notes"
+            )
+            let adapter = FakeAXAdapter(permission: .granted, windows: [selected])
+            let report = await adapter.perform(
+                request(
+                    for: wrongTarget.identity,
+                    scope: AXAuthorizationScope(allowedTargets: [selected.identity])
+                )
+            )
+            expect(report.failureReason == .targetNotAuthorized)
+            expect(report.writesPerformed == 0)
+            let writes = await adapter.currentWriteCount()
+            expect(writes == 0)
+        }
+
+        await run("generic restore discovery groups each app and process once") {
+            let first = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let sameProcess = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Notes",
+                identifier: "notes"
+            )
+            let secondApplication = applicationWindow(
+                bundleIdentifier: "com.example.Terminal",
+                processID: 701,
+                title: "Shell",
+                identifier: "shell"
+            )
+            let adapter = FakeAXAdapter(
+                permission: .granted,
+                windows: [first, sameProcess, secondApplication]
+            )
+            let targets = [first.identity, sameProcess.identity, secondApplication.identity]
+            let processIdentities = AXApplicationDiscovery.uniqueProcessIdentities(from: targets)
+            for process in processIdentities {
+                let target = targets.first {
+                    $0.bundleIdentifier == process.bundleIdentifier
+                        && $0.processID == process.processID
+                }!
+                _ = await adapter.windowResult(for: target)
+            }
+            if processIdentities.count != 2 {
+                fail("expected two process identities, got \(processIdentities.count)")
+            }
+            let discoveryCount = await adapter.windowDiscoveryCount()
+            if discoveryCount != 2 {
+                fail("expected two discovery calls, got \(discoveryCount)")
+            }
+        }
+
         await run("permission denied performs zero writes") {
             let adapter = FakeAXAdapter(permission: .denied, windows: [fixtureWindow()])
             let report = await adapter.perform(request(for: fixtureIdentity()))
@@ -380,6 +563,30 @@ struct SceneShelfAXTestRunner {
             }
         }
 
+        await run("selected candidates isolate the store input from unselected duplicates") {
+            let selected = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let duplicateUnselected = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Notes",
+                identifier: "notes"
+            )
+            do {
+                let preparation = try AXSceneCapturePreparation.prepare(
+                    candidates: [selected, duplicateUnselected, duplicateUnselected],
+                    selectedIDs: [selected.identity]
+                )
+                expect(preparation.selectedCandidates == [selected])
+            } catch {
+                fail("selected candidate projection unexpectedly failed: \(error)")
+            }
+        }
+
         await run("public AX contract contains Sendable values only") {
             let snapshot = fixtureWindow()
             let value: any Sendable = snapshot
@@ -475,6 +682,37 @@ struct SceneShelfAXTestRunner {
         )
     }
 
+    private static func request(
+        for target: AXWindowIdentity,
+        scope: AXAuthorizationScope
+    ) -> AXOperationRequest {
+        AXOperationRequest(
+            target: target,
+            frame: AXFrame(x: 120, y: 140, width: 800, height: 600),
+            operations: [.move],
+            authorizationScope: scope
+        )
+    }
+
+    private static func applicationWindow(
+        bundleIdentifier: String,
+        processID: Int32,
+        title: String,
+        identifier: String?,
+        frame: AXFrame? = AXFrame(x: 180, y: 620, width: 360, height: 220)
+    ) -> AXWindowSnapshot {
+        AXWindowSnapshot(
+            identity: AXWindowIdentity(
+                bundleIdentifier: bundleIdentifier,
+                processID: processID,
+                title: title,
+                identifier: identifier
+            ),
+            frame: frame,
+            isMinimized: false
+        )
+    }
+
     private static func applicationProcess(
         appName: String,
         bundleIdentifier: String?,
@@ -512,6 +750,7 @@ private actor FakeAXAdapter: AXWindowAdapter {
     private let catalogResult: AXApplicationCatalogResult?
     private(set) var writeCount = 0
     private(set) var observedRequests: [AXOperationRequest] = []
+    private(set) var observedWindowDiscoveryTargets: [AXWindowIdentity] = []
 
     init(
         permission: PermissionState,
@@ -550,14 +789,34 @@ private actor FakeAXAdapter: AXWindowAdapter {
         catalogResult ?? .success([])
     }
 
+    func windowResult(for target: AXWindowIdentity) async -> AXWindowDiscoveryResult {
+        observedWindowDiscoveryTargets.append(target)
+        return .success(windows)
+    }
+
     func currentWriteCount() -> Int { writeCount }
 
     func requestCount() -> Int { observedRequests.count }
+
+    func windowDiscoveryCount() -> Int { observedWindowDiscoveryTargets.count }
 
     func perform(_ request: AXOperationRequest) -> AXOperationReport {
         observedRequests.append(request)
         guard permission == .granted else {
             return report(for: request, failure: .permissionDenied)
+        }
+
+        if let scope = request.authorizationScope {
+            let authorization = AXAuthorizationPolicy.authorize(
+                target: request.target,
+                scope: scope
+            )
+            guard authorization == .authorized else {
+                return report(
+                    for: request,
+                    failure: authorization.failureReason ?? .targetNotAuthorized
+                )
+            }
         }
 
         var applied: [AXOperation] = []
@@ -568,7 +827,19 @@ private actor FakeAXAdapter: AXWindowAdapter {
             } else {
                 candidates = candidateSequence.removeFirst()
             }
-            switch AXSafetyPolicy.resolve(target: request.target, candidates: candidates) {
+            let resolution: AXResolution
+            if request.authorizationScope == nil {
+                resolution = AXSafetyPolicy.resolve(
+                    target: request.target,
+                    candidates: candidates
+                )
+            } else {
+                resolution = AXApplicationSafetyPolicy.resolve(
+                    target: request.target,
+                    candidates: candidates
+                )
+            }
+            switch resolution {
             case .unique:
                 guard apply(operation, to: request.target, frame: request.frame) else {
                     return report(

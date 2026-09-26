@@ -2,7 +2,7 @@
 
 ## 前提・仕様サマリ
 
-- P1-8は一般アプリ候補のread-only列挙とShelf表示だけを扱い、候補から保存・復元・AX writeへ接続しない。
+- P1-8当時は一般アプリ候補のread-only列挙とShelf表示だけを扱い、候補から保存・復元・AX writeへ接続しなかった。現行の明示選択保存・復元はP1-9/DR-025の別契約で扱う。
 - AX raw referenceはadapter actor内に閉じ、公開値は`AXApplicationProcessSnapshot`、`AXApplicationCandidate`、`AXWindowSnapshot`だけとする。
 - permission deniedは候補空、`permissionDenied`、write 0。Scene Shelf自身、Bundle IDなし、UIなし、background-only、windowなしは除外する。
 - group keyはBundle IDだけでなくPIDを含む。同Bundleの別processは別候補として残す。
@@ -60,5 +60,5 @@
 ## 未カバー・検討事項
 
 - 実機で一般アプリを列挙したGUI表示、VoiceOver、候補の大量件数・スクロールは未実施。
-- P1-8では候補を保存対象へ昇格しない。任意アプリへのwrite、PID再利用時のrestore matcher、複数displayは後続Decisionで扱う。
+- P1-8時点では候補を保存対象へ昇格しなかった。任意アプリへのwriteとPID再利用時のrestore matcherはP1-9/DR-025で明示選択・安全境界を追加済み。複数displayは引き続き対象外。
 - `NSRunningApplication.activationPolicy`の実機分類精度はread-only manualで再確認する。

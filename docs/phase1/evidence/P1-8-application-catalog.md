@@ -6,9 +6,9 @@
 
 ## 判定
 
-P1-8の自動検証はPASS。一般アプリの候補をSendable値型へ正規化し、Scene Shelf自身・Bundle IDなし・UIなし・background-only・windowなしを除外する。同一Bundle IDの別PIDは別groupとして残る。Shelf UIには「アプリ候補を確認」button、grouped list、保存・復元へ未接続である旨の日本語説明を追加した。
+P1-8時点の自動検証はPASS。一般アプリの候補をSendable値型へ正規化し、Scene Shelf自身・Bundle IDなし・UIなし・background-only・windowなしを除外する。同一Bundle IDの別PIDは別groupとして残る。P1-8当時のShelf UIには「アプリ候補を確認」button、grouped list、候補確認が保存・復元へ未接続である旨の日本語説明を追加した。現行の明示選択保存・復元はP1-9/DR-025で別境界として追加済みである。
 
-P1-8はread-onlyカタログであり、候補を保存対象へ昇格する機能、任意アプリへのwrite、実機での一般アプリ列挙manualは未実施である。既存Fixture限定のsave/restoreとwrite直前再解決は変更していない。
+P1-8当時はread-onlyカタログであり、候補を保存対象へ昇格する機能、任意アプリへのwrite、実機での一般アプリ列挙manualは未実施だった。現行のP1-9では、明示選択した対象だけを保存・復元へ渡す認可境界を自動検証している。既存Fixture限定のsave/restoreとwrite直前再解決は維持している。
 
 ## TDD Red
 
@@ -34,7 +34,7 @@ cannot find 'SceneShelfApplicationCatalogPresentation' in scope
 - `AXTypes.swift`: process observation、candidate、catalog result、pure normalizer、Scene Shelf bundle除外、adapterのread-only default boundary。
 - `AXSystemAdapter.swift`: permission read後に`NSWorkspace`のrunning applicationを列挙し、AX attribute readだけでwindow snapshotを生成。SetAttributeValue/terminate/closeは呼ばない。bundle IDなし、Scene Shelf自身、prohibited activation policyはAX query前に除外する。
 - `SceneShelfApplicationCatalogPresentation.swift`: button/list identifier、端末内window title/PIDのread-only notice、app/window value formatter、候補ID＋indexの一意window row、権限状態を反映するcatalog state。
-- `AppDelegate.swift`: `inspectApplicationCandidates()`と「一般アプリ候補（読み取り専用）」grouped list。candidate行はTextだけでsave/restore actionなし。permission再確認がdeniedになった場合は候補を即時クリアし、権限取消しメッセージを表示する。window行はPresentation row経由で描画する。
+- `AppDelegate.swift`: P1-8当時は`inspectApplicationCandidates()`と「一般アプリ候補（読み取り専用）」grouped listを表示し、candidate行はTextだけでsave/restore actionなしだった。現行はP1-9で、選択Toggle・名前入力・選択対象だけの保存を追加している。permission再確認がdeniedになった場合は候補を即時クリアし、権限取消しメッセージを表示する。window行はPresentation row経由で描画する。
 - runners: AX fake adapterでpermission/write 0、除外規則、同Bundle別PID、value fields。Presentation runnerでread-only文言と表示値を検証。
 
 ## レビュー修正 TDD Red / Green（2026-09-26 JST）
@@ -96,4 +96,4 @@ strict `swift build`、strict `swift test`、`scripts/build-app.sh`、`scripts/b
 
 - 実機で「アプリ候補を確認」をクリックして一般アプリのgrouped listを確認するmanualは未実施。
 - Accessibility permission denied/grantedの実機カタログ表示、VoiceOver、候補リスト大量件数のスクロールは未実施。
-- 任意アプリへの保存・復元・move/resize/minimizeは意図的に未接続。候補から保存対象へ進む仕様は後続P1-9で、別のallowlist/matcher/write契約として設計する。
+- P1-8当時は任意アプリへの保存・復元・move/resize/minimizeを意図的に未接続とした。現行P1-9では、候補から明示選択した対象だけを保存・復元するallowlist/matcher/write契約をDR-025として追加済み。実機での一般アプリ選択保存・restoreは未実施。

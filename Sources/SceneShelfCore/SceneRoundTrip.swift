@@ -114,6 +114,7 @@ public enum SceneFailureReason: String, Error, Equatable, Sendable {
     case pidReused
     case operationFailed
     case bundleNotAllowed
+    case targetNotAuthorized
 
     public var japaneseLabel: String {
         switch self {
@@ -133,6 +134,8 @@ public enum SceneFailureReason: String, Error, Equatable, Sendable {
             return "ウィンドウ操作に失敗しました"
         case .bundleNotAllowed:
             return "許可されていないBundle IDです"
+        case .targetNotAuthorized:
+            return "保存対象として選択されていないため操作しません"
         }
     }
 }
@@ -166,36 +169,47 @@ public enum SceneMatchDecision: Equatable, Sendable {
 /// Pure value matcher used before an operation becomes a write instruction.
 public enum SceneMatcher {
     public static let fixtureBundleIdentifier = "com.fscoward.SceneShelfAXFixture"
+    public static let sceneShelfBundleIdentifier = "com.fscoward.sceneshelf"
 
     public static func resolve(
         target: SceneWindowIdentity,
         candidates: [SceneWindowSnapshot]
     ) -> SceneMatchDecision {
-        guard target.bundleIdentifier == fixtureBundleIdentifier else {
+        guard !target.bundleIdentifier.isEmpty,
+              target.bundleIdentifier != sceneShelfBundleIdentifier else {
             return .bundleNotAllowed
         }
 
         let allowedCandidates = candidates.filter {
-            $0.identity.bundleIdentifier == fixtureBundleIdentifier
+            $0.identity.bundleIdentifier == target.bundleIdentifier
         }
-        let exactHints = allowedCandidates.filter {
+        let sameProcessCandidates = allowedCandidates.filter {
+            $0.identity.processID == target.processID
+        }
+        let sameProcessExactHints = sameProcessCandidates.filter {
             $0.identity.title == target.title && $0.identity.identifier == target.identifier
         }
-        if exactHints.count > 1 {
+        if sameProcessExactHints.count > 1 {
             return .ambiguous
         }
-        if let exact = exactHints.first {
-            return exact.identity.processID == target.processID
-                ? .matched(exact)
-                : .pidReused
+        if let exact = sameProcessExactHints.first {
+            return .matched(exact)
         }
 
-        let samePIDAndIdentifier = allowedCandidates.contains {
-            $0.identity.processID == target.processID
+        let sameProcessAndIdentifier = sameProcessCandidates.contains {
+            $0.identity.identifier == target.identifier
+        }
+        if sameProcessAndIdentifier {
+            return .windowChanged
+        }
+
+        let otherProcessExactHints = allowedCandidates.filter {
+            $0.identity.processID != target.processID
+                && $0.identity.title == target.title
                 && $0.identity.identifier == target.identifier
         }
-        if samePIDAndIdentifier {
-            return .windowChanged
+        if !otherProcessExactHints.isEmpty {
+            return .pidReused
         }
         return .missing
     }
@@ -644,6 +658,11 @@ public actor InMemorySceneStore {
             throw SceneManagementError.sceneNotFound(sceneID)
         }
         let current = storedScenes[sceneIndex]
+        guard current.windows.allSatisfy({
+            $0.identity.bundleIdentifier == SceneMatcher.fixtureBundleIdentifier
+        }) else {
+            throw SceneManagementError.applicationOverwriteUnsupported
+        }
         guard Set(current.windows.map(\.identity)).count == current.windows.count else {
             throw SceneManagementError.targetUnavailable(.ambiguousMatch)
         }
@@ -891,6 +910,10 @@ public actor InMemorySceneStore {
 
     public func scenes() -> [SavedScene] {
         storedScenes
+    }
+
+    public func scene(sceneID: SceneID) -> SavedScene? {
+        storedScenes.first { $0.id == sceneID }
     }
 
     public func cards() -> [SceneCardSnapshot] {

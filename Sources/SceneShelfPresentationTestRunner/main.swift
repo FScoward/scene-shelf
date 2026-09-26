@@ -85,6 +85,7 @@ struct SceneShelfPresentationTestRunner {
         runTest(testPersistenceDiagnosticPresentationBoundary)
         runTest(testApplicationCatalogPresentationBoundary)
         runTest(testApplicationCatalogWindowRowsAndPermissionRevocation)
+        runTest(testApplicationCatalogSelectionPresentation)
 
         if failures == 0 {
             print("SceneShelfPresentationTestRunner: \(executedTests) tests passed")
@@ -394,6 +395,13 @@ struct SceneShelfPresentationTestRunner {
             !SceneShelfManagementPresentation.shouldRefreshAfterDeleteFailure(activeFailure),
             "non-cleanup delete failures do not refresh as if the record were removed"
         )
+
+        let unsupportedOverwrite = SceneManagementError.applicationOverwriteUnsupported
+        expect(
+            SceneShelfManagementPresentation.message(for: unsupportedOverwrite)
+                .contains("一般アプリ配置の上書きは未対応"),
+            "generic overwrite keeps an explicit Japanese unsupported message"
+        )
     }
 
     private static func testPersistenceDiagnosticPresentationBoundary() {
@@ -484,10 +492,10 @@ struct SceneShelfPresentationTestRunner {
         )
         expect(
             SceneShelfApplicationCatalogPresentation.readOnlyNotice.contains("読み取り専用")
-                && SceneShelfApplicationCatalogPresentation.readOnlyNotice.contains("保存・復元には接続していません")
+                && SceneShelfApplicationCatalogPresentation.readOnlyNotice.contains("保存・復元は選択したwindowだけ")
                 && SceneShelfApplicationCatalogPresentation.readOnlyNotice.contains("window title/PID")
                 && SceneShelfApplicationCatalogPresentation.readOnlyNotice.contains("端末内"),
-            "application catalog explicitly states that it is read-only"
+            "application catalog observation is read-only and only selected windows are persisted/restored"
         )
         let candidateLabel = SceneShelfApplicationCatalogPresentation.candidateLabel(for: candidate)
         expect(
@@ -535,6 +543,18 @@ struct SceneShelfPresentationTestRunner {
         expect(rows.count == 2, "duplicate window observations remain visible as two rows")
         expect(Set(rows.map(\.id)).count == 2, "window row IDs include a stable index")
         expect(rows[0].label != rows[1].label, "duplicate window rows retain distinct value details")
+        expect(rows.allSatisfy { !$0.isSelectable }, "duplicate window rows are not selectable")
+        expect(
+            rows.allSatisfy {
+                SceneShelfApplicationCatalogPresentation.selectionLabel(for: $0)
+                    .contains("一意に識別できないため保存対象にできません")
+            },
+            "duplicate window rows explain that they cannot become save targets"
+        )
+        expect(
+            SceneShelfApplicationCatalogPresentation.selectableWindowIDs(from: candidate).isEmpty,
+            "duplicate identity rows contribute no selectable identity"
+        )
 
         let granted = SceneShelfApplicationCatalogPresentation.catalogState(
             permission: .granted,
@@ -547,6 +567,50 @@ struct SceneShelfPresentationTestRunner {
         )
         expect(revoked.candidates.isEmpty, "permission revocation clears catalog candidates")
         expect(revoked.message.contains("権限が取り消された"), "revocation message names permission cancellation")
+        let failedCatalog = SceneShelfApplicationCatalogPresentation.catalogState(
+            permission: .granted,
+            result: .failure(.permissionDenied)
+        )
+        expect(failedCatalog.candidates.isEmpty, "catalog failure clears candidates")
+        expect(failedCatalog.message.contains("権限"), "catalog failure keeps a Japanese permission reason")
+        expect(
+            SceneShelfApplicationCatalogPresentation.selectedWindowIDs(
+                existing: [duplicateWindowIdentity],
+                from: failedCatalog
+            ).isEmpty,
+            "catalog failure clears the selection set"
+        )
+    }
+
+    private static func testApplicationCatalogSelectionPresentation() {
+        let window = AXWindowSnapshot(
+            identity: AXWindowIdentity(
+                bundleIdentifier: "com.example.Editor",
+                processID: 703,
+                title: "Draft",
+                identifier: "draft"
+            ),
+            frame: AXFrame(x: 0, y: 0, width: 640, height: 480),
+            isMinimized: false
+        )
+        let candidate = AXApplicationCandidate(
+            appName: "Text Editor",
+            bundleIdentifier: "com.example.Editor",
+            processID: 703,
+            windows: [window]
+        )
+        let row = SceneShelfApplicationCatalogPresentation.windowRows(for: candidate)[0]
+        expect(
+            SceneShelfApplicationCatalogPresentation.nameFieldIdentifier == "application-scene-name"
+                && SceneShelfApplicationCatalogPresentation.saveButtonIdentifier == "application-save-scene",
+            "application selection exposes stable name and save identifiers"
+        )
+        expect(
+            SceneShelfApplicationCatalogPresentation.selectionLabel(for: row).contains("保存対象")
+                && SceneShelfApplicationCatalogPresentation.selectionLabel(for: row).contains("Draft"),
+            "application selection label explains the saved target in Japanese"
+        )
+        expect(row.isSelectable, "unique application window row is selectable")
     }
 
     private static func sendClick(to window: NSWindow, at point: NSPoint) {

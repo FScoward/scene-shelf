@@ -65,6 +65,47 @@ public actor AXSystemAdapter: AXWindowAdapter {
         return windows.isEmpty ? .failure(.windowMissing) : .success(windows)
     }
 
+    public func windowResult(for target: AXWindowIdentity) -> AXWindowDiscoveryResult {
+        if target.bundleIdentifier == SceneShelfAXContract.fixtureBundleIdentifier {
+            return fixtureWindowResult()
+        }
+        guard AXIsProcessTrusted() else {
+            return .failure(.permissionDenied)
+        }
+        guard !target.bundleIdentifier.isEmpty,
+              target.bundleIdentifier != SceneShelfAXContract.sceneShelfBundleIdentifier else {
+            return .failure(.bundleNotAllowed)
+        }
+
+        let applications = NSRunningApplication.runningApplications(
+            withBundleIdentifier: target.bundleIdentifier
+        )
+        guard !applications.isEmpty else {
+            return .failure(.applicationUnavailable)
+        }
+        guard let application = applications.first(where: {
+            $0.processIdentifier == target.processID
+        }) else {
+            return .failure(.pidReused)
+        }
+        guard application.activationPolicy != .prohibited else {
+            return .failure(.bundleNotAllowed)
+        }
+
+        let appElement = AXUIElementCreateApplication(application.processIdentifier)
+        guard let values = copyAttribute(appElement, kAXWindowsAttribute) as? [AXUIElement] else {
+            return .failure(.applicationUnavailable)
+        }
+        let windows = values.compactMap {
+            snapshot(
+                of: $0,
+                processID: application.processIdentifier,
+                bundleIdentifier: target.bundleIdentifier
+            )
+        }
+        return windows.isEmpty ? .failure(.windowMissing) : .success(windows)
+    }
+
     /// Enumerates running applications and their accessible windows without
     /// issuing any AX write. The normalizer removes Scene Shelf itself,
     /// background-only apps, and observations without a usable bundle ID.
@@ -108,6 +149,34 @@ public actor AXSystemAdapter: AXWindowAdapter {
     }
 
     public func perform(_ request: AXOperationRequest) -> AXOperationReport {
+        guard AXIsProcessTrusted() else {
+            return AXOperationReport(
+                target: request.target,
+                requestedOperations: request.operations,
+                failureReason: .permissionDenied
+            )
+        }
+
+        if let scope = request.authorizationScope {
+            let authorization = AXAuthorizationPolicy.authorize(
+                target: request.target,
+                scope: scope
+            )
+            guard authorization == .authorized else {
+                return AXOperationReport(
+                    target: request.target,
+                    requestedOperations: request.operations,
+                    failureReason: authorization.failureReason
+                )
+            }
+            if request.target.bundleIdentifier != SceneShelfAXContract.fixtureBundleIdentifier {
+                return performGeneric(request)
+            }
+        }
+        return performFixture(request)
+    }
+
+    private func performFixture(_ request: AXOperationRequest) -> AXOperationReport {
         let requested = request.operations
         func report(
             applied: [AXOperation] = [],
@@ -123,9 +192,6 @@ public actor AXSystemAdapter: AXWindowAdapter {
             )
         }
 
-        guard AXIsProcessTrusted() else {
-            return report(failure: .permissionDenied)
-        }
         guard request.target.bundleIdentifier == SceneShelfAXContract.fixtureBundleIdentifier else {
             return report(failure: .bundleNotAllowed)
         }
@@ -154,6 +220,47 @@ public actor AXSystemAdapter: AXWindowAdapter {
             case let .success(rawWindow):
                 guard apply(operation, to: rawWindow.element, frame: request.frame) else {
                     return report(applied: applied, writes: writes, failure: .operationFailed)
+                }
+                writes += 1
+                applied.append(operation)
+            }
+        }
+        return report(applied: applied, writes: writes)
+    }
+
+    private func performGeneric(_ request: AXOperationRequest) -> AXOperationReport {
+        let requested = request.operations
+        func report(
+            applied: [AXOperation] = [],
+            writes: Int = 0,
+            failure: FailureReason? = nil
+        ) -> AXOperationReport {
+            AXOperationReport(
+                target: request.target,
+                requestedOperations: requested,
+                appliedOperations: applied,
+                writesPerformed: writes,
+                failureReason: failure
+            )
+        }
+
+        guard !requested.isEmpty else {
+            return report()
+        }
+
+        var applied: [AXOperation] = []
+        var writes = 0
+        for operation in requested {
+            switch resolveGenericRawWindow(target: request.target) {
+            case let .failure(reason):
+                return report(applied: applied, writes: writes, failure: reason)
+            case let .success(rawWindow):
+                guard apply(operation, to: rawWindow.element, frame: request.frame) else {
+                    return report(
+                        applied: applied,
+                        writes: writes,
+                        failure: .operationFailed
+                    )
                 }
                 writes += 1
                 applied.append(operation)
@@ -205,6 +312,66 @@ public actor AXSystemAdapter: AXWindowAdapter {
         let resolution = AXSafetyPolicy.resolve(
             target: target,
             candidates: rawWindows.map { $0.snapshot }
+        )
+        switch resolution {
+        case let .unique(snapshot):
+            guard let match = rawWindows.first(where: { $0.snapshot == snapshot }) else {
+                return .failure(.windowMissing)
+            }
+            return .success(match)
+        case .missing:
+            return .failure(.windowMissing)
+        case .ambiguous:
+            return .failure(.ambiguousMatch)
+        case .windowChanged:
+            return .failure(.windowChanged)
+        case .pidReused:
+            return .failure(.pidReused)
+        case .bundleNotAllowed:
+            return .failure(.bundleNotAllowed)
+        }
+    }
+
+    private func resolveGenericRawWindow(
+        target: AXWindowIdentity
+    ) -> Result<ResolvedRawWindow, FailureReason> {
+        guard !target.bundleIdentifier.isEmpty,
+              target.bundleIdentifier != SceneShelfAXContract.sceneShelfBundleIdentifier else {
+            return .failure(.bundleNotAllowed)
+        }
+
+        let applications = NSRunningApplication.runningApplications(
+            withBundleIdentifier: target.bundleIdentifier
+        )
+        guard !applications.isEmpty else {
+            return .failure(.applicationUnavailable)
+        }
+        guard let application = applications.first(where: {
+            $0.processIdentifier == target.processID
+        }) else {
+            return .failure(.pidReused)
+        }
+        guard application.activationPolicy != .prohibited else {
+            return .failure(.bundleNotAllowed)
+        }
+
+        let appElement = AXUIElementCreateApplication(application.processIdentifier)
+        guard let values = copyAttribute(appElement, kAXWindowsAttribute) as? [AXUIElement] else {
+            return .failure(.applicationUnavailable)
+        }
+        let rawWindows = values.compactMap { element -> ResolvedRawWindow? in
+            guard let snapshot = snapshot(
+                of: element,
+                processID: application.processIdentifier,
+                bundleIdentifier: target.bundleIdentifier
+            ) else {
+                return nil
+            }
+            return ResolvedRawWindow(element: element, snapshot: snapshot)
+        }
+        let resolution = AXApplicationSafetyPolicy.resolve(
+            target: target,
+            candidates: rawWindows.map(\.snapshot)
         )
         switch resolution {
         case let .unique(snapshot):

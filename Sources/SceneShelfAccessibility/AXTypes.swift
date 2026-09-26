@@ -138,6 +138,31 @@ public struct AXApplicationCandidate: Equatable, Sendable, Identifiable {
     }
 }
 
+public struct AXApplicationProcessIdentity: Equatable, Hashable, Sendable {
+    public let bundleIdentifier: String
+    public let processID: Int32
+
+    public init(bundleIdentifier: String, processID: Int32) {
+        self.bundleIdentifier = bundleIdentifier
+        self.processID = processID
+    }
+}
+
+public enum AXApplicationDiscovery {
+    public static func uniqueProcessIdentities(
+        from targets: [AXWindowIdentity]
+    ) -> [AXApplicationProcessIdentity] {
+        var seen = Set<AXApplicationProcessIdentity>()
+        return targets.compactMap { target in
+            let process = AXApplicationProcessIdentity(
+                bundleIdentifier: target.bundleIdentifier,
+                processID: target.processID
+            )
+            return seen.insert(process).inserted ? process : nil
+        }
+    }
+}
+
 public struct AXApplicationCatalogResult: Equatable, Sendable {
     public let candidates: [AXApplicationCandidate]
     public let failureReason: FailureReason?
@@ -207,6 +232,7 @@ public enum FailureReason: String, Error, Equatable, Sendable {
     case pidReused
     case operationFailed
     case bundleNotAllowed
+    case targetNotAuthorized
 
     public var japaneseLabel: String {
         switch self {
@@ -226,6 +252,8 @@ public enum FailureReason: String, Error, Equatable, Sendable {
             return "AX操作に失敗しました"
         case .bundleNotAllowed:
             return "許可されていないBundle IDです"
+        case .targetNotAuthorized:
+            return "保存対象として選択されていないため操作しません"
         }
     }
 }
@@ -276,15 +304,18 @@ public struct AXOperationRequest: Equatable, Sendable {
     public let target: AXWindowIdentity
     public let frame: AXFrame?
     public let operations: [AXOperation]
+    public let authorizationScope: AXAuthorizationScope?
 
     public init(
         target: AXWindowIdentity,
         frame: AXFrame? = nil,
-        operations: [AXOperation] = [.move, .resize, .minimize]
+        operations: [AXOperation] = [.move, .resize, .minimize],
+        authorizationScope: AXAuthorizationScope? = nil
     ) {
         self.target = target
         self.frame = frame
         self.operations = operations
+        self.authorizationScope = authorizationScope
     }
 }
 
@@ -381,11 +412,100 @@ public enum AXSafetyPolicy {
     }
 }
 
+/// The exact identities selected by a user are the only targets a scoped
+/// generic operation may write. This value never contains raw AX references.
+public struct AXAuthorizationScope: Equatable, Sendable {
+    public let allowedTargets: Set<AXWindowIdentity>
+
+    public init(allowedTargets: Set<AXWindowIdentity>) {
+        self.allowedTargets = allowedTargets
+    }
+}
+
+public enum AXAuthorizationDecision: Equatable, Sendable {
+    case authorized
+    case targetNotAuthorized
+    case bundleNotAllowed
+
+    public var failureReason: FailureReason? {
+        switch self {
+        case .authorized:
+            return nil
+        case .targetNotAuthorized:
+            return .targetNotAuthorized
+        case .bundleNotAllowed:
+            return .bundleNotAllowed
+        }
+    }
+}
+
+/// Pure authorization for a write request originating from an explicit
+/// catalog selection. Membership is exact: title, optional identifier, PID,
+/// and bundle must all match the saved identity.
+public enum AXAuthorizationPolicy {
+    public static func authorize(
+        target: AXWindowIdentity,
+        scope: AXAuthorizationScope
+    ) -> AXAuthorizationDecision {
+        guard !target.bundleIdentifier.isEmpty,
+              target.bundleIdentifier != SceneShelfAXContract.sceneShelfBundleIdentifier else {
+            return .bundleNotAllowed
+        }
+        guard scope.allowedTargets.contains(target) else {
+            return .targetNotAuthorized
+        }
+        return .authorized
+    }
+}
+
+/// Pure matcher for a currently running non-Shelf application. A PID match is
+/// mandatory; title plus identifier must then resolve to exactly one window.
+public enum AXApplicationSafetyPolicy {
+    public static func resolve(
+        target: AXWindowIdentity,
+        candidates: [AXWindowSnapshot]
+    ) -> AXResolution {
+        guard !target.bundleIdentifier.isEmpty,
+              target.bundleIdentifier != SceneShelfAXContract.sceneShelfBundleIdentifier else {
+            return .bundleNotAllowed
+        }
+
+        let sameBundle = candidates.filter {
+            $0.identity.bundleIdentifier == target.bundleIdentifier
+        }
+        let sameProcess = sameBundle.filter {
+            $0.identity.processID == target.processID
+        }
+        let exactHints = sameProcess.filter {
+            $0.identity.title == target.title && $0.identity.identifier == target.identifier
+        }
+        if exactHints.count > 1 {
+            return .ambiguous
+        }
+        if let exact = exactHints.first {
+            return .unique(exact)
+        }
+
+        let sameHintDifferentPID = sameBundle.filter {
+            $0.identity.title == target.title && $0.identity.identifier == target.identifier
+        }
+        if !sameHintDifferentPID.isEmpty {
+            return .pidReused
+        }
+
+        if sameProcess.contains(where: { $0.identity.identifier == target.identifier }) {
+            return .windowChanged
+        }
+        return .missing
+    }
+}
+
 /// The UI and test runners exchange this protocol, never raw AX references.
 public protocol AXWindowAdapter: Sendable {
     func permissionStatus() async -> PermissionStatus
     func fixtureWindows() async -> [AXWindowSnapshot]
     func fixtureWindowResult() async -> AXWindowDiscoveryResult
+    func windowResult(for target: AXWindowIdentity) async -> AXWindowDiscoveryResult
     func applicationCatalog() async -> AXApplicationCatalogResult
     func perform(_ request: AXOperationRequest) async -> AXOperationReport
 }
@@ -396,6 +516,15 @@ public extension AXWindowAdapter {
     /// discovery failure reason that an empty list alone would lose.
     func fixtureWindowResult() async -> AXWindowDiscoveryResult {
         .success(await fixtureWindows())
+    }
+
+    /// Existing fixture-only fakes remain source-compatible. Live adapters
+    /// override this boundary for exact bundle/PID application reads.
+    func windowResult(for target: AXWindowIdentity) async -> AXWindowDiscoveryResult {
+        if target.bundleIdentifier == SceneShelfAXContract.fixtureBundleIdentifier {
+            return await fixtureWindowResult()
+        }
+        return .failure(.applicationUnavailable)
     }
 
     /// Existing fixture-only fakes remain source-compatible. The live adapter
@@ -431,6 +560,14 @@ public enum AXSceneCaptureError: Error, Equatable, Sendable {
 public struct AXSceneCapturePreparation: Equatable, Sendable {
     public let candidates: [AXWindowSnapshot]
     public let selectedIDs: Set<AXWindowIdentity>
+
+    /// The validated, selected-only projection to pass into scene storage.
+    /// Keeping this separate from `candidates` lets a stale or duplicated
+    /// unselected catalog row remain observable without making it part of the
+    /// saved scene's duplicate-identity contract.
+    public var selectedCandidates: [AXWindowSnapshot] {
+        candidates.filter { selectedIDs.contains($0.identity) }
+    }
 
     public init(
         candidates: [AXWindowSnapshot],
