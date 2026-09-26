@@ -182,6 +182,59 @@ struct SceneShelfP0FourTestRunner {
             }
         }
 
+        await run("background restore follows display failure and complete hide boundaries") {
+            let target = fixtureWindow(id: "main", processID: 101)
+            let failedDisplay = SceneRestoreReport(
+                sceneID: "scene-display-failed",
+                action: .display,
+                outcomes: [
+                    .failed(
+                        target: target.identity,
+                        reason: .operationFailed
+                    )
+                ]
+            )
+            let partialDisplay = SceneRestoreReport(
+                sceneID: "scene-display-partial",
+                action: .display,
+                outcomes: [
+                    .succeeded(
+                        target: target.identity,
+                        appliedOperations: [.unminimize]
+                    ),
+                    .failed(
+                        target: fixtureWindow(id: "secondary", processID: 101).identity,
+                        reason: .windowMissing
+                    )
+                ]
+            )
+            let completeHide = SceneRestoreReport(
+                sceneID: "scene-hide-complete",
+                action: .hide,
+                outcomes: [
+                    .succeeded(
+                        target: target.identity,
+                        appliedOperations: [.minimize]
+                    )
+                ]
+            )
+            let failedHide = SceneRestoreReport(
+                sceneID: "scene-hide-failed",
+                action: .hide,
+                outcomes: [
+                    .failed(
+                        target: target.identity,
+                        reason: .operationFailed
+                    )
+                ]
+            )
+            expect(SceneBackgroundRestorePolicy.shouldRestore(after: failedDisplay))
+            expect(SceneBackgroundRestorePolicy.shouldRestore(after: completeHide))
+            expect(SceneBackgroundRestorePolicy.shouldRestore(after: partialDisplay) == false)
+            expect(SceneBackgroundRestorePolicy.shouldRestore(after: failedHide) == false)
+            expect(SceneBackgroundRestorePolicy.shouldRestore(after: nil) == false)
+        }
+
         await run("legacy bool executor failure rolls back state currentSceneID and report") {
             let main = fixtureWindow(id: "main", processID: 101)
             let store = InMemorySceneStore()

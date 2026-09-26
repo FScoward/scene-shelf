@@ -103,6 +103,390 @@ struct SceneShelfAXTestRunner {
             expect(candidate?.windows.first?.isMinimized == true)
         }
 
+        await run("visible general windows isolate Finder and System Settings by exact identity") {
+            let displayTarget = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 601,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let finder = applicationWindow(
+                bundleIdentifier: "com.apple.finder",
+                processID: 701,
+                title: "Documents",
+                identifier: "finder-window"
+            )
+            let systemSettings = applicationWindow(
+                bundleIdentifier: "com.apple.systempreferences",
+                processID: 702,
+                title: "アクセシビリティ",
+                identifier: "accessibility"
+            )
+            let alreadyMinimized = applicationWindow(
+                bundleIdentifier: "com.example.Terminal",
+                processID: 703,
+                title: "Shell",
+                identifier: "shell",
+                minimized: true
+            )
+            let sceneShelf = applicationWindow(
+                bundleIdentifier: SceneShelfAXContract.sceneShelfBundleIdentifier,
+                processID: 704,
+                title: "Scene Shelf",
+                identifier: "main"
+            )
+            let processes = [
+                applicationProcess(
+                    appName: "Scene Shelf",
+                    bundleIdentifier: sceneShelf.identity.bundleIdentifier,
+                    processID: sceneShelf.identity.processID,
+                    window: sceneShelf
+                ),
+                applicationProcess(
+                    appName: "Draft Editor",
+                    bundleIdentifier: displayTarget.identity.bundleIdentifier,
+                    processID: displayTarget.identity.processID,
+                    window: displayTarget
+                ),
+                applicationProcess(
+                    appName: "Finder",
+                    bundleIdentifier: finder.identity.bundleIdentifier,
+                    processID: finder.identity.processID,
+                    window: finder
+                ),
+                applicationProcess(
+                    appName: "System Settings",
+                    bundleIdentifier: systemSettings.identity.bundleIdentifier,
+                    processID: systemSettings.identity.processID,
+                    window: systemSettings
+                ),
+                applicationProcess(
+                    appName: "Terminal",
+                    bundleIdentifier: alreadyMinimized.identity.bundleIdentifier,
+                    processID: alreadyMinimized.identity.processID,
+                    window: alreadyMinimized
+                )
+            ]
+            let catalog = AXApplicationCatalogNormalizer.normalize(processes)
+            let isolated = AXApplicationIsolationPolicy.visibleWindowsToIsolate(
+                from: catalog,
+                excluding: [displayTarget.identity]
+            )
+            expect(isolated.map(\.identity) == [finder.identity, systemSettings.identity])
+            expect(isolated.allSatisfy { !$0.isMinimized })
+            expect(isolated.contains { $0.identity.bundleIdentifier == SceneShelfAXContract.sceneShelfBundleIdentifier } == false)
+        }
+
+        await run("isolation coordinator minimizes background windows and restores them after hide") {
+            let displayTarget = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 601,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let finder = applicationWindow(
+                bundleIdentifier: "com.apple.finder",
+                processID: 701,
+                title: "Documents",
+                identifier: "finder-window"
+            )
+            let systemSettings = applicationWindow(
+                bundleIdentifier: "com.apple.systempreferences",
+                processID: 702,
+                title: "アクセシビリティ",
+                identifier: "accessibility"
+            )
+            let catalog = AXApplicationCatalogResult.success(
+                AXApplicationCatalogNormalizer.normalize([
+                    applicationProcess(
+                        appName: "Draft Editor",
+                        bundleIdentifier: displayTarget.identity.bundleIdentifier,
+                        processID: displayTarget.identity.processID,
+                        window: displayTarget
+                    ),
+                    applicationProcess(
+                        appName: "Finder",
+                        bundleIdentifier: finder.identity.bundleIdentifier,
+                        processID: finder.identity.processID,
+                        window: finder
+                    ),
+                    applicationProcess(
+                        appName: "System Settings",
+                        bundleIdentifier: systemSettings.identity.bundleIdentifier,
+                        processID: systemSettings.identity.processID,
+                        window: systemSettings
+                    )
+                ])
+            )
+            let adapter = FakeAXAdapter(
+                permission: .granted,
+                windows: [displayTarget, finder, systemSettings],
+                catalogResult: catalog
+            )
+            let coordinator = AXWindowIsolationCoordinator()
+
+            let isolation = await coordinator.isolateBeforeDisplay(
+                excluding: [displayTarget.identity],
+                adapter: adapter
+            )
+            expect(isolation.succeeded)
+            let retainedAfterIsolation = await coordinator.retainedSnapshots()
+            expect(retainedAfterIsolation.map(\.identity) == [
+                finder.identity,
+                systemSettings.identity
+            ])
+
+            let restoreFailures = await coordinator.restoreBackground(adapter: adapter)
+            expect(restoreFailures.isEmpty)
+            let retainedAfterRestore = await coordinator.retainedSnapshots()
+            expect(retainedAfterRestore.isEmpty)
+            let requests = await adapter.requests()
+            expect(requests.map(\.operations) == [
+                [.minimize],
+                [.minimize],
+                [.unminimize],
+                [.unminimize]
+            ])
+            expect(requests[0].authorizationScope?.allowedTargets == Set([
+                finder.identity,
+                systemSettings.identity
+            ]))
+            expect(requests[2].authorizationScope?.allowedTargets == Set([
+                finder.identity,
+                systemSettings.identity
+            ]))
+        }
+
+        await run("switch isolation does not unminimize the previous background set") {
+            let sceneA = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 601,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let sceneB = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 601,
+                title: "Review",
+                identifier: "review"
+            )
+            let previousBackground = applicationWindow(
+                bundleIdentifier: "com.apple.finder",
+                processID: 701,
+                title: "Documents",
+                identifier: "finder-window"
+            )
+            let newBackground = applicationWindow(
+                bundleIdentifier: "com.apple.systempreferences",
+                processID: 702,
+                title: "アクセシビリティ",
+                identifier: "accessibility"
+            )
+            let firstCatalog = AXApplicationCatalogNormalizer.normalize([
+                applicationProcess(
+                    appName: "Draft Editor",
+                    bundleIdentifier: sceneA.identity.bundleIdentifier,
+                    processID: sceneA.identity.processID,
+                    window: sceneA
+                ),
+                applicationProcess(
+                    appName: "Finder",
+                    bundleIdentifier: previousBackground.identity.bundleIdentifier,
+                    processID: previousBackground.identity.processID,
+                    window: previousBackground
+                )
+            ])
+            let firstAdapter = FakeAXAdapter(
+                permission: .granted,
+                windows: [sceneA, previousBackground],
+                catalogResult: .success(firstCatalog)
+            )
+            let coordinator = AXWindowIsolationCoordinator()
+            _ = await coordinator.isolateBeforeDisplay(
+                excluding: [sceneA.identity],
+                adapter: firstAdapter
+            )
+
+            let minimizedPrevious = applicationWindow(
+                bundleIdentifier: previousBackground.identity.bundleIdentifier,
+                processID: previousBackground.identity.processID,
+                title: previousBackground.identity.title,
+                identifier: previousBackground.identity.identifier,
+                minimized: true
+            )
+            let secondCatalog = AXApplicationCatalogNormalizer.normalize([
+                applicationProcess(
+                    appName: "Review Editor",
+                    bundleIdentifier: sceneB.identity.bundleIdentifier,
+                    processID: sceneB.identity.processID,
+                    window: sceneB
+                ),
+                applicationProcess(
+                    appName: "Finder",
+                    bundleIdentifier: minimizedPrevious.identity.bundleIdentifier,
+                    processID: minimizedPrevious.identity.processID,
+                    window: minimizedPrevious
+                ),
+                applicationProcess(
+                    appName: "System Settings",
+                    bundleIdentifier: newBackground.identity.bundleIdentifier,
+                    processID: newBackground.identity.processID,
+                    window: newBackground
+                )
+            ])
+            let secondAdapter = FakeAXAdapter(
+                permission: .granted,
+                windows: [sceneB, minimizedPrevious, newBackground],
+                catalogResult: .success(secondCatalog)
+            )
+            _ = await coordinator.isolateBeforeDisplay(
+                excluding: [sceneB.identity],
+                adapter: secondAdapter
+            )
+
+            let secondRequests = await secondAdapter.requests()
+            expect(secondRequests.map(\.operations) == [[.minimize]])
+            expect(secondRequests.first?.target == newBackground.identity)
+            let retainedAfterSwitch = await coordinator.retainedSnapshots()
+            expect(retainedAfterSwitch.map(\.identity) == [
+                previousBackground.identity,
+                newBackground.identity
+            ])
+        }
+
+        await run("already minimized background windows are not retained or restored") {
+            let minimized = applicationWindow(
+                bundleIdentifier: "com.apple.finder",
+                processID: 701,
+                title: "Documents",
+                identifier: "finder-window",
+                minimized: true
+            )
+            let catalog = AXApplicationCatalogNormalizer.normalize([
+                applicationProcess(
+                    appName: "Finder",
+                    bundleIdentifier: minimized.identity.bundleIdentifier,
+                    processID: minimized.identity.processID,
+                    window: minimized
+                )
+            ])
+            let adapter = FakeAXAdapter(
+                permission: .granted,
+                windows: [minimized],
+                catalogResult: .success(catalog)
+            )
+            let coordinator = AXWindowIsolationCoordinator()
+            let isolation = await coordinator.isolateBeforeDisplay(
+                excluding: [],
+                adapter: adapter
+            )
+            expect(isolation.succeeded)
+            let retained = await coordinator.retainedSnapshots()
+            expect(retained.isEmpty)
+            let requests = await adapter.requests()
+            expect(requests.isEmpty)
+            let restoreFailures = await coordinator.restoreBackground(adapter: adapter)
+            expect(restoreFailures.isEmpty)
+        }
+
+        await run("restore failure keeps the exact background snapshot for retry") {
+            let finder = applicationWindow(
+                bundleIdentifier: "com.apple.finder",
+                processID: 701,
+                title: "Documents",
+                identifier: "finder-window"
+            )
+            let catalog = AXApplicationCatalogNormalizer.normalize([
+                applicationProcess(
+                    appName: "Finder",
+                    bundleIdentifier: finder.identity.bundleIdentifier,
+                    processID: finder.identity.processID,
+                    window: finder
+                )
+            ])
+            let adapter = FakeAXAdapter(
+                permission: .granted,
+                windows: [finder],
+                candidateSequence: [[finder], [], [finder]],
+                catalogResult: .success(catalog)
+            )
+            let coordinator = AXWindowIsolationCoordinator()
+            _ = await coordinator.isolateBeforeDisplay(
+                excluding: [],
+                adapter: adapter
+            )
+            let firstRestore = await coordinator.restoreBackground(adapter: adapter)
+            expect(firstRestore.map(\.target) == [finder.identity])
+            let retainedAfterFailure = await coordinator.retainedSnapshots()
+            expect(retainedAfterFailure.map(\.identity) == [finder.identity])
+
+            let retryFailures = await coordinator.restoreBackground(adapter: adapter)
+            expect(retryFailures.isEmpty)
+            let retainedAfterRetry = await coordinator.retainedSnapshots()
+            expect(retainedAfterRetry.isEmpty)
+        }
+
+        await run("background isolation failure keeps successful retention for later restore") {
+            let sceneTarget = applicationWindow(
+                bundleIdentifier: "com.example.Editor",
+                processID: 601,
+                title: "Draft",
+                identifier: "draft"
+            )
+            let finder = applicationWindow(
+                bundleIdentifier: "com.apple.finder",
+                processID: 701,
+                title: "Documents",
+                identifier: "finder-window"
+            )
+            let systemSettings = applicationWindow(
+                bundleIdentifier: "com.apple.systempreferences",
+                processID: 702,
+                title: "アクセシビリティ",
+                identifier: "accessibility"
+            )
+            let catalog = AXApplicationCatalogNormalizer.normalize([
+                applicationProcess(
+                    appName: "Draft Editor",
+                    bundleIdentifier: sceneTarget.identity.bundleIdentifier,
+                    processID: sceneTarget.identity.processID,
+                    window: sceneTarget
+                ),
+                applicationProcess(
+                    appName: "Finder",
+                    bundleIdentifier: finder.identity.bundleIdentifier,
+                    processID: finder.identity.processID,
+                    window: finder
+                ),
+                applicationProcess(
+                    appName: "System Settings",
+                    bundleIdentifier: systemSettings.identity.bundleIdentifier,
+                    processID: systemSettings.identity.processID,
+                    window: systemSettings
+                )
+            ])
+            let adapter = FakeAXAdapter(
+                permission: .granted,
+                windows: [sceneTarget, finder, systemSettings],
+                candidateSequence: [[sceneTarget, finder], []],
+                catalogResult: .success(catalog)
+            )
+            let coordinator = AXWindowIsolationCoordinator()
+            let isolation = await coordinator.isolateBeforeDisplay(
+                excluding: [sceneTarget.identity],
+                adapter: adapter
+            )
+            expect(isolation.succeeded == false)
+            expect(isolation.failures.map(\.target) == [systemSettings.identity])
+            let retained = await coordinator.retainedSnapshots()
+            expect(retained.map(\.identity) == [finder.identity])
+
+            let restoreFailures = await coordinator.restoreBackground(adapter: adapter)
+            expect(restoreFailures.isEmpty)
+            let remaining = await coordinator.retainedSnapshots()
+            expect(remaining.isEmpty)
+        }
+
         await run("selected application authorization rejects an unselected target") {
             let selected = applicationWindow(
                 bundleIdentifier: "com.example.Editor",
@@ -699,7 +1083,8 @@ struct SceneShelfAXTestRunner {
         processID: Int32,
         title: String,
         identifier: String?,
-        frame: AXFrame? = AXFrame(x: 180, y: 620, width: 360, height: 220)
+        frame: AXFrame? = AXFrame(x: 180, y: 620, width: 360, height: 220),
+        minimized: Bool = false
     ) -> AXWindowSnapshot {
         AXWindowSnapshot(
             identity: AXWindowIdentity(
@@ -709,7 +1094,7 @@ struct SceneShelfAXTestRunner {
                 identifier: identifier
             ),
             frame: frame,
-            isMinimized: false
+            isMinimized: minimized
         )
     }
 
@@ -797,6 +1182,8 @@ private actor FakeAXAdapter: AXWindowAdapter {
     func currentWriteCount() -> Int { writeCount }
 
     func requestCount() -> Int { observedRequests.count }
+
+    func requests() -> [AXOperationRequest] { observedRequests }
 
     func windowDiscoveryCount() -> Int { observedWindowDiscoveryTargets.count }
 

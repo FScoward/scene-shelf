@@ -223,6 +223,164 @@ public enum AXApplicationCatalogNormalizer {
     }
 }
 
+/// Selects visible non-Shelf windows that must be isolated before a saved
+/// scene is displayed. The caller supplies the scene's explicit target
+/// identities; every other candidate remains subject to the temporary,
+/// exact-identity authorization scope created by the caller.
+public enum AXApplicationIsolationPolicy {
+    public static func visibleWindowsToIsolate(
+        from candidates: [AXApplicationCandidate],
+        excluding displayTargets: Set<AXWindowIdentity>
+    ) -> [AXWindowSnapshot] {
+        candidates
+            .flatMap(\.windows)
+            .filter { window in
+                window.identity.bundleIdentifier != SceneShelfAXContract.sceneShelfBundleIdentifier
+                    && !window.isMinimized
+                    && !displayTargets.contains(window.identity)
+            }
+    }
+}
+
+/// Runtime-only hold for windows that Scene Shelf successfully minimized as
+/// background context. It intentionally stores value snapshots, not AX
+/// references, so failed restores can remain retryable without weakening the
+/// exact-identity write boundary.
+public actor AXBackgroundWindowRuntime {
+    private var retained: [AXWindowIdentity: AXWindowSnapshot] = [:]
+
+    public init() {}
+
+    public func retain(_ snapshots: [AXWindowSnapshot]) {
+        for snapshot in snapshots where !snapshot.isMinimized {
+            retained[snapshot.identity] = snapshot
+        }
+    }
+
+    public func remove(_ identity: AXWindowIdentity) {
+        retained.removeValue(forKey: identity)
+    }
+
+    public func snapshots() -> [AXWindowSnapshot] {
+        retained.values.sorted { lhs, rhs in
+            lhs.identity.id < rhs.identity.id
+        }
+    }
+}
+
+public struct AXWindowIsolationFailure: Equatable, Sendable, Identifiable {
+    public let target: AXWindowIdentity
+    public let reason: FailureReason
+
+    public var id: String { target.id }
+
+    public init(target: AXWindowIdentity, reason: FailureReason) {
+        self.target = target
+        self.reason = reason
+    }
+}
+
+public struct AXWindowIsolationResult: Equatable, Sendable {
+    public let catalogFailure: FailureReason?
+    public let failures: [AXWindowIsolationFailure]
+
+    public var succeeded: Bool {
+        catalogFailure == nil && failures.isEmpty
+    }
+
+    public init(
+        catalogFailure: FailureReason? = nil,
+        failures: [AXWindowIsolationFailure] = []
+    ) {
+        self.catalogFailure = catalogFailure
+        self.failures = failures
+    }
+}
+
+/// Coordinates the short-lived background isolation scope and the runtime
+/// hold used to restore only windows that were actually minimized by the
+/// current Scene Shelf process.
+public actor AXWindowIsolationCoordinator {
+    private let runtime: AXBackgroundWindowRuntime
+
+    public init(runtime: AXBackgroundWindowRuntime = AXBackgroundWindowRuntime()) {
+        self.runtime = runtime
+    }
+
+    public func isolateBeforeDisplay(
+        excluding displayTargets: Set<AXWindowIdentity>,
+        adapter: any AXWindowAdapter
+    ) async -> AXWindowIsolationResult {
+        let catalogResult = await adapter.applicationCatalog()
+        guard let catalogFailure = catalogResult.failureReason else {
+            let candidates = AXApplicationIsolationPolicy.visibleWindowsToIsolate(
+                from: catalogResult.candidates,
+                excluding: displayTargets
+            )
+            let scope = AXAuthorizationScope(
+                allowedTargets: Set(candidates.map(\.identity))
+            )
+            var failures: [AXWindowIsolationFailure] = []
+            for candidate in candidates {
+                let report = await adapter.perform(
+                    AXOperationRequest(
+                        target: candidate.identity,
+                        operations: [.minimize],
+                        authorizationScope: scope
+                    )
+                )
+                if report.succeeded {
+                    await runtime.retain([candidate])
+                } else {
+                    failures.append(
+                        AXWindowIsolationFailure(
+                            target: candidate.identity,
+                            reason: report.failureReason ?? .operationFailed
+                        )
+                    )
+                }
+            }
+            return AXWindowIsolationResult(failures: failures)
+        }
+        return AXWindowIsolationResult(catalogFailure: catalogFailure)
+    }
+
+    public func restoreBackground(
+        adapter: any AXWindowAdapter
+    ) async -> [AXWindowIsolationFailure] {
+        let retained = await runtime.snapshots()
+        guard !retained.isEmpty else { return [] }
+        let scope = AXAuthorizationScope(
+            allowedTargets: Set(retained.map(\.identity))
+        )
+        var failures: [AXWindowIsolationFailure] = []
+        for snapshot in retained {
+            let report = await adapter.perform(
+                AXOperationRequest(
+                    target: snapshot.identity,
+                    operations: [.unminimize],
+                    authorizationScope: scope
+                )
+            )
+            if report.succeeded {
+                await runtime.remove(snapshot.identity)
+            } else {
+                failures.append(
+                    AXWindowIsolationFailure(
+                        target: snapshot.identity,
+                        reason: report.failureReason ?? .operationFailed
+                    )
+                )
+            }
+        }
+        return failures
+    }
+
+    public func retainedSnapshots() async -> [AXWindowSnapshot] {
+        await runtime.snapshots()
+    }
+}
+
 public enum FailureReason: String, Error, Equatable, Sendable {
     case permissionDenied
     case applicationUnavailable

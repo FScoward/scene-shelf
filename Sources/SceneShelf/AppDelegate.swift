@@ -4,6 +4,37 @@ import SceneShelfCore
 import SceneShelfPresentation
 import SwiftUI
 
+private actor SceneIsolationOperationState {
+    private var messages: [String] = []
+
+    func recordCatalogFailure(_ reason: FailureReason) {
+        messages.append("背景ウィンドウ一覧を取得できませんでした: \(reason.japaneseLabel)")
+    }
+
+    func recordIsolationFailure(
+        target: AXWindowIdentity,
+        reason: FailureReason
+    ) {
+        messages.append(
+            "背景ウィンドウを退避できませんでした: \(target.title): \(reason.japaneseLabel)"
+        )
+    }
+
+    func recordRestoreFailure(
+        target: AXWindowIdentity,
+        reason: SceneFailureReason
+    ) {
+        messages.append(
+            "背景ウィンドウを復元できませんでした: \(target.title): \(reason.japaneseLabel)"
+        )
+    }
+
+    func message() -> String {
+        var seen = Set<String>()
+        return messages.filter { seen.insert($0).inserted }.joined(separator: "\n")
+    }
+}
+
 @MainActor
 final class ShelfViewModel: ObservableObject {
     private static let fixtureTargetFrame = AXFrame(
@@ -45,6 +76,7 @@ final class ShelfViewModel: ObservableObject {
     private let coordinator: SceneCoordinator
     private let sceneStore: InMemorySceneStore
     private let accessibilityAdapter: any AXWindowAdapter
+    private let backgroundWindowCoordinator = AXWindowIsolationCoordinator()
     private let persistenceInitializationError: ScenePersistenceError?
 
     private struct DefaultSceneStore {
@@ -603,11 +635,30 @@ final class ShelfViewModel: ObservableObject {
 
         let store = sceneStore
         let adapter = accessibilityAdapter
+        let backgroundWindowCoordinator = self.backgroundWindowCoordinator
         Task { @MainActor [weak self] in
             guard let self else { return }
             statusMessage = "保存済み配置を操作中です"
+            let operationState = SceneIsolationOperationState()
             let operationTask = Task {
                 await store.clickDetailed(sceneID: sceneID) { basePlan in
+                    if basePlan.action == .display {
+                        let isolationResult = await backgroundWindowCoordinator.isolateBeforeDisplay(
+                            excluding: Set(
+                                basePlan.instructions.map { Self.axIdentity(from: $0.target) }
+                            ),
+                            adapter: adapter
+                        )
+                        if let failureReason = isolationResult.catalogFailure {
+                            await operationState.recordCatalogFailure(failureReason)
+                        }
+                        for failure in isolationResult.failures {
+                            await operationState.recordIsolationFailure(
+                                target: failure.target,
+                                reason: failure.reason
+                            )
+                        }
+                    }
                     let plan = await Self.prepareRestorePlan(
                         basePlan,
                         adapter: adapter
@@ -659,6 +710,14 @@ final class ShelfViewModel: ObservableObject {
             let outcome = await operationTask.value
             let reportSceneID = Self.reportSceneID(for: outcome, requestedSceneID: sceneID)
             let report = await store.report(sceneID: reportSceneID)
+            if SceneBackgroundRestorePolicy.shouldRestore(after: report),
+               await store.currentSceneID() == nil {
+                await Self.restoreBackgroundWindows(
+                    coordinator: backgroundWindowCoordinator,
+                    adapter: adapter,
+                    operationState: operationState
+                )
+            }
             lastSceneReport = report
             if let report {
                 let message = SceneFailureMessageFormatter.format(report)
@@ -695,7 +754,29 @@ final class ShelfViewModel: ObservableObject {
                     statusMessage = "表示できる保存済み配置がありません"
                 }
             }
+            let isolationMessage = await operationState.message()
+            if !isolationMessage.isEmpty {
+                statusMessage += "。\(isolationMessage)"
+                let reportMessage = report.map(SceneFailureMessageFormatter.format) ?? ""
+                accessibilityMessage = [reportMessage, isolationMessage]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "\n")
+            }
             await refresh()
+        }
+    }
+
+    nonisolated private static func restoreBackgroundWindows(
+        coordinator: AXWindowIsolationCoordinator,
+        adapter: any AXWindowAdapter,
+        operationState: SceneIsolationOperationState
+    ) async {
+        let failures = await coordinator.restoreBackground(adapter: adapter)
+        for failure in failures {
+            await operationState.recordRestoreFailure(
+                target: failure.target,
+                reason: SceneFailureReason(rawValue: failure.reason.rawValue) ?? .operationFailed
+            )
         }
     }
 
