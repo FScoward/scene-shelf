@@ -77,6 +77,7 @@ struct SceneShelfPresentationTestRunner {
         }
         runTest(testFailureMessageFormat)
         runTest(testLongContentLayout)
+        runTest(testShelfViewportBackgroundIsOpaque)
         runTest(testPanelScrollOperation)
         runTest(testShelfActivation)
         runTest(testPrimaryCardHitArea)
@@ -169,6 +170,93 @@ struct SceneShelfPresentationTestRunner {
         expect(
             documentHeight > contentHeight,
             "long shelf content is taller than its scroll viewport"
+        )
+    }
+
+    private static func testShelfViewportBackgroundIsOpaque() {
+        let hosting = NSHostingView(
+            rootView: ShelfScrollContainer {
+                Color.clear
+                    .frame(width: SceneShelfLayout.viewportWidth, height: 1)
+            }
+        )
+        hosting.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: SceneShelfLayout.viewportWidth,
+            height: SceneShelfLayout.viewportHeight
+        )
+        let panel = NSPanel(
+            contentRect: NSRect(origin: .zero, size: SceneShelfLayout.viewportSize),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.appearance = NSAppearance(named: .aqua)
+        panel.contentView = hosting
+        panel.contentView?.layoutSubtreeIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+
+        guard let background = descendants(of: hosting).first(where: {
+            $0.identifier?.rawValue == "scene-shelf-viewport-background"
+        }) else {
+            expect(false, "shelf viewport renders a discoverable background view")
+            return
+        }
+
+        let alpha = background.layer?.backgroundColor?.components?.last ?? 0
+        expect(
+            background.frame.width >= SceneShelfLayout.viewportWidth
+                && background.frame.height >= SceneShelfLayout.viewportHeight,
+            "shelf viewport background covers the full fixed viewport"
+        )
+        expect(
+            background.isOpaque && background.layer?.isOpaque == true && alpha == 1,
+            "shelf viewport background is fully opaque"
+        )
+        expect(
+            !panel.isOpaque && panel.backgroundColor?.isEqual(NSColor.clear) == true,
+            "transparent shelf panel does not remove the viewport background"
+        )
+        expect(
+            background.hitTest(NSPoint(x: 10, y: 10)) == nil,
+            "shelf viewport background does not intercept clicks"
+        )
+
+        guard let aquaAppearance = NSAppearance(named: .aqua),
+            let darkAppearance = NSAppearance(named: .darkAqua) else {
+            expect(false, "aqua and darkAqua appearances are available")
+            return
+        }
+
+        panel.appearance = aquaAppearance
+        panel.contentView?.layoutSubtreeIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        let aquaColor = background.layer?.backgroundColor
+        expect(
+            colorsMatch(
+                aquaColor,
+                windowBackgroundColor(for: aquaAppearance)
+            ),
+            "aqua appearance uses the system window background color"
+        )
+
+        panel.appearance = darkAppearance
+        panel.contentView?.layoutSubtreeIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        let darkColor = background.layer?.backgroundColor
+        expect(
+            colorsMatch(
+                darkColor,
+                windowBackgroundColor(for: darkAppearance)
+            ),
+            "darkAqua appearance uses the system window background color"
+        )
+        expect(
+            !colorsMatch(aquaColor, darkColor),
+            "appearance changes update the viewport background layer color"
         )
     }
 
@@ -635,6 +723,26 @@ struct SceneShelfPresentationTestRunner {
 
     private static func descendants(of view: NSView) -> [NSView] {
         view.subviews + view.subviews.flatMap(descendants(of:))
+    }
+
+    private static func colorsMatch(_ lhs: CGColor?, _ rhs: CGColor?) -> Bool {
+        guard let lhs, let rhs,
+            lhs.numberOfComponents == rhs.numberOfComponents,
+            let lhsComponents = lhs.components,
+            let rhsComponents = rhs.components else {
+            return false
+        }
+        return zip(lhsComponents, rhsComponents).allSatisfy {
+            abs($0 - $1) < 0.0001
+        }
+    }
+
+    private static func windowBackgroundColor(for appearance: NSAppearance) -> CGColor? {
+        var color: CGColor?
+        appearance.performAsCurrentDrawingAppearance {
+            color = NSColor.windowBackgroundColor.cgColor
+        }
+        return color
     }
 
     private static func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
