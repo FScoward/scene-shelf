@@ -5,7 +5,7 @@ import SceneShelfCore
 /// SwiftUI can deliver the card button action before the management menu item
 /// action for the same mouse event. The primary request therefore remains
 /// pending until the caller explicitly consumes it. A management declaration
-/// synchronously invalidates that pending request for the same scene.
+/// synchronously invalidates pending requests while management owns the shelf.
 @MainActor
 public final class SceneShelfInteractionGate {
     public struct PrimaryRequest: Equatable, Sendable {
@@ -13,14 +13,14 @@ public final class SceneShelfInteractionGate {
         fileprivate let sequence: UInt64
     }
 
-    public struct ManagementScope: Equatable, Sendable {
+    public struct ManagementScope: Equatable, Hashable, Sendable {
         fileprivate let sceneID: SceneID
         fileprivate let sequence: UInt64
     }
 
     private var nextSequence: UInt64 = 0
     private var pendingPrimaryRequests: [SceneID: PrimaryRequest] = [:]
-    private var activeManagementScopes: [SceneID: ManagementScope] = [:]
+    private var activeManagementScopes: Set<ManagementScope> = []
 
     public init() {}
 
@@ -33,26 +33,25 @@ public final class SceneShelfInteractionGate {
     }
 
     /// Starts a management action for a scene. Any pending primary request
-    /// for that same scene is cancelled, and new primary requests are blocked
-    /// until the returned scope is ended.
+    /// for the shelf are cancelled, and new primary requests are blocked until
+    /// the returned scope is ended.
     public func beginManagement(sceneID: SceneID) -> ManagementScope {
         nextSequence &+= 1
         let scope = ManagementScope(sceneID: sceneID, sequence: nextSequence)
-        activeManagementScopes[sceneID] = scope
-        pendingPrimaryRequests.removeValue(forKey: sceneID)
+        activeManagementScopes.insert(scope)
+        pendingPrimaryRequests.removeAll()
         return scope
     }
 
     /// Ends a management action if it is still the active scope for its scene.
     public func endManagement(_ scope: ManagementScope) {
-        guard activeManagementScopes[scope.sceneID] == scope else { return }
-        activeManagementScopes.removeValue(forKey: scope.sceneID)
+        activeManagementScopes.remove(scope)
     }
 
-    /// Consumes a primary request exactly once if it was not superseded by
-    /// management action for the same scene.
+    /// Consumes a primary request exactly once if no management action owns
+    /// any card in the shelf.
     public func consumePrimary(_ request: PrimaryRequest) -> Bool {
-        guard activeManagementScopes[request.sceneID] == nil else {
+        guard activeManagementScopes.isEmpty else {
             return false
         }
         guard pendingPrimaryRequests[request.sceneID] == request else {

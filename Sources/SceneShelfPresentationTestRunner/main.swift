@@ -840,10 +840,53 @@ struct SceneShelfPresentationTestRunner {
         let otherScenePrimary = gate.requestPrimary(sceneID: "scene-b")
         let otherSceneManagement = gate.beginManagement(sceneID: "scene-a")
         expect(
-            gate.consumePrimary(otherScenePrimary),
-            "management action for another scene does not suppress the primary request"
+            !gate.consumePrimary(otherScenePrimary),
+            "management action for another scene suppresses every shelf primary action"
         )
         gate.endManagement(otherSceneManagement)
+
+        let primaryAfterManagement = gate.requestPrimary(sceneID: "scene-b")
+        expect(
+            gate.consumePrimary(primaryAfterManagement),
+            "all shelf primary actions resume after management ends"
+        )
+
+        let primaryBeforeOtherManagement = gate.requestPrimary(sceneID: "scene-b")
+        let otherManagementAfterPrimary = gate.beginManagement(sceneID: "scene-a")
+        expect(
+            !gate.consumePrimary(primaryBeforeOtherManagement),
+            "management action for another scene suppresses a pending primary request"
+        )
+        gate.endManagement(otherManagementAfterPrimary)
+        expect(
+            !gate.consumePrimary(primaryBeforeOtherManagement),
+            "a primary request cancelled by management does not resume after management ends"
+        )
+
+        let sameSceneScopeA = gate.beginManagement(sceneID: "scene-a")
+        let sameSceneScopeB = gate.beginManagement(sceneID: "scene-a")
+        let nestedSameScenePrimary = gate.requestPrimary(sceneID: "scene-b")
+        gate.endManagement(sameSceneScopeB)
+        expect(
+            !gate.consumePrimary(nestedSameScenePrimary),
+            "ending a newer same-scene management scope keeps the older scope active"
+        )
+        gate.endManagement(sameSceneScopeA)
+        let afterNestedSameScene = gate.requestPrimary(sceneID: "scene-b")
+        expect(
+            gate.consumePrimary(afterNestedSameScene),
+            "all primary actions resume after every same-scene scope ends"
+        )
+
+        let crossSceneScopeA = gate.beginManagement(sceneID: "scene-a")
+        let crossSceneScopeB = gate.beginManagement(sceneID: "scene-b")
+        let nestedCrossScenePrimary = gate.requestPrimary(sceneID: "scene-c")
+        gate.endManagement(crossSceneScopeB)
+        expect(
+            !gate.consumePrimary(nestedCrossScenePrimary),
+            "ending one cross-scene management scope keeps another scope active"
+        )
+        gate.endManagement(crossSceneScopeA)
     }
 
     private static func testStageManagerPreviewCardBoundary() {
