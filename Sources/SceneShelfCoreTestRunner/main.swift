@@ -199,6 +199,41 @@ struct SceneShelfCoreTestRunner {
             )
         }
 
+        await run("workspace window resolver uses AX identifier before frame") {
+            let target = SceneWindowSnapshot(
+                identity: SceneWindowIdentity(
+                    bundleIdentifier: "com.example.editor",
+                    processID: 10,
+                    title: "Document",
+                    identifier: "main"
+                ),
+                frame: SceneFrame(x: 10, y: 10, width: 400, height: 300),
+                isMinimized: false
+            )
+            let candidates = [
+                WorkspaceWindowCandidate(
+                    windowID: 23,
+                    bundleIdentifier: target.identity.bundleIdentifier,
+                    processID: target.identity.processID,
+                    title: target.identity.title,
+                    identifier: "other",
+                    frame: target.frame
+                ),
+                WorkspaceWindowCandidate(
+                    windowID: 24,
+                    bundleIdentifier: target.identity.bundleIdentifier,
+                    processID: target.identity.processID,
+                    title: target.identity.title,
+                    identifier: target.identity.identifier,
+                    frame: SceneFrame(x: 800, y: 400, width: 500, height: 400)
+                )
+            ]
+            expect(
+                WorkspaceWindowResolver.resolve(target: target, candidates: candidates)
+                    == .matched(windowID: 24)
+            )
+        }
+
         await run("workspace window resolver fails when duplicate identities stay ambiguous") {
             let target = SceneWindowSnapshot(
                 identity: SceneWindowIdentity(

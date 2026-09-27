@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import CoreGraphics
 import Darwin
 import Foundation
@@ -290,19 +291,22 @@ public struct WorkspaceWindowCandidate: Equatable, Sendable {
     public let bundleIdentifier: String
     public let processID: Int32
     public let title: String
-    public let frame: SceneFrame
+    public let identifier: String?
+    public let frame: SceneFrame?
 
     public init(
         windowID: UInt32,
         bundleIdentifier: String,
         processID: Int32,
         title: String,
-        frame: SceneFrame
+        identifier: String? = nil,
+        frame: SceneFrame? = nil
     ) {
         self.windowID = windowID
         self.bundleIdentifier = bundleIdentifier
         self.processID = processID
         self.title = title
+        self.identifier = identifier
         self.frame = frame
     }
 }
@@ -323,6 +327,7 @@ public enum WorkspaceWindowResolver {
             $0.bundleIdentifier == target.identity.bundleIdentifier
                 && $0.processID == target.identity.processID
                 && $0.title == target.identity.title
+                && $0.identifier == target.identity.identifier
         }
         guard !identityMatches.isEmpty else { return .missing }
         guard identityMatches.count > 1 else {
@@ -330,7 +335,8 @@ public enum WorkspaceWindowResolver {
         }
 
         let frameMatches = identityMatches.filter {
-            frameApproximatelyEqual($0.frame, target.frame, tolerance: frameTolerance)
+            guard let candidateFrame = $0.frame else { return false }
+            return frameApproximatelyEqual(candidateFrame, target.frame, tolerance: frameTolerance)
         }
         guard frameMatches.count == 1 else { return .ambiguous }
         return .matched(windowID: frameMatches[0].windowID)
@@ -471,6 +477,46 @@ fileprivate final class SkyLightReadOnlyBridge: @unchecked Sendable {
     }
 }
 
+/// Read-only bridge from an Accessibility element to its Core Graphics
+/// window number. The public AX API deliberately does not expose this number,
+/// so this private symbol is isolated here and is never used for mutation.
+fileprivate final class AXWindowIDReadOnlyBridge: @unchecked Sendable {
+    private typealias GetWindowFunction = @convention(c) (
+        AXUIElement,
+        UnsafeMutablePointer<CGWindowID>
+    ) -> AXError
+
+    private let handle: UnsafeMutableRawPointer
+    private let getWindow: GetWindowFunction
+
+    init() throws {
+        // Swift's Darwin overlay does not expose the RTLD_DEFAULT macro on
+        // this CLT SDK. A handle for the current process has the same lookup
+        // scope and keeps the symbol resolution local and read-only.
+        guard let handle = dlopen(nil, RTLD_LAZY | RTLD_LOCAL) else {
+            throw WorkspaceContextError.privateAPIUnavailable
+        }
+        self.handle = handle
+        guard let pointer = dlsym(handle, "_AXUIElementGetWindow") else {
+            dlclose(handle)
+            throw WorkspaceContextError.privateAPIUnavailable
+        }
+        getWindow = unsafeBitCast(pointer, to: GetWindowFunction.self)
+    }
+
+    deinit {
+        dlclose(handle)
+    }
+
+    func windowID(for element: AXUIElement) throws -> CGWindowID {
+        var windowID: CGWindowID = 0
+        guard getWindow(element, &windowID) == .success, windowID != 0 else {
+            throw WorkspaceContextError.currentContextUnavailable
+        }
+        return windowID
+    }
+}
+
 /// Production provider. It lazily loads SkyLight so tests and unsupported
 /// environments fail only when a Space-scoped operation is requested.
 public struct SkyLightWorkspaceContextProvider: WorkspaceContextProviding, Sendable {
@@ -496,9 +542,12 @@ public struct SkyLightWorkspaceContextProvider: WorkspaceContextProviding, Senda
     }
 }
 
-/// Runtime window-to-Space validation. It resolves windows through the same
-/// bundle/PID/title/layer/sharing/frame safety boundary as the existing AX
-/// code, then asks SkyLight only for those resolved window IDs.
+/// Runtime window-to-Space validation. It resolves the target through the
+/// Accessibility window list (title + identifier), obtains the exact
+/// CoreGraphics window number from that raw AX element, then asks SkyLight
+/// only for that resolved window ID. It deliberately does not use
+/// CGWindowList: its titles and frames can be redacted by Screen Recording
+/// privacy even when Accessibility can identify the target.
 public struct SkyLightWorkspaceWindowMembershipProvider: WorkspaceWindowMembershipProviding, Sendable {
     public init() {
     }
@@ -508,8 +557,15 @@ public struct SkyLightWorkspaceWindowMembershipProvider: WorkspaceWindowMembersh
         in context: WorkspaceContext
     ) throws {
         let skyLight = try SkyLightWorkspaceContextProvider.bridgeValue()
-        let candidates = windowCandidates()
+        guard AXIsProcessTrusted() else {
+            throw WorkspaceContextError.currentContextUnavailable
+        }
+        let windowIDBridge = try AXWindowIDReadOnlyBridge()
         for window in windows {
+            let candidates = try windowCandidates(
+                for: window.identity,
+                windowIDBridge: windowIDBridge
+            )
             let windowID: CGWindowID
             switch WorkspaceWindowResolver.resolve(target: window, candidates: candidates) {
             case let .matched(resolvedID):
@@ -538,46 +594,89 @@ public struct SkyLightWorkspaceWindowMembershipProvider: WorkspaceWindowMembersh
         }
     }
 
-    private func windowCandidates() -> [WorkspaceWindowCandidate] {
-        guard let raw = CGWindowListCopyWindowInfo(
-            [.optionAll],
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
+    private func windowCandidates(
+        for target: SceneWindowIdentity,
+        windowIDBridge: AXWindowIDReadOnlyBridge
+    ) throws -> [WorkspaceWindowCandidate] {
+        guard let application = NSRunningApplication(
+            processIdentifier: pid_t(target.processID)
+        ), application.bundleIdentifier == target.bundleIdentifier,
+        application.activationPolicy != .prohibited else {
             return []
         }
-        return raw.compactMap { info in
-            guard let windowID = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
-                  let processID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
-                  let title = info[kCGWindowName as String] as? String,
-                  !title.isEmpty,
-                  let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue,
-                  layer == 0,
-                  let sharing = (info[kCGWindowSharingState as String] as? NSNumber)?.intValue,
-                  sharing != 0,
-                  let bounds = info[kCGWindowBounds as String] as? NSDictionary,
-                  let application = NSRunningApplication(processIdentifier: pid_t(processID)),
-                  let bundleIdentifier = application.bundleIdentifier else {
+
+        let applicationElement = AXUIElementCreateApplication(application.processIdentifier)
+        var rawValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            applicationElement,
+            kAXWindowsAttribute as CFString,
+            &rawValue
+        ) == .success else {
+            throw WorkspaceContextError.currentContextUnavailable
+        }
+        guard let elements = rawValue as? [AXUIElement] else {
+            throw WorkspaceContextError.malformedPayload
+        }
+
+        return try elements.compactMap { element in
+            guard let title = copyAttribute(element, kAXTitleAttribute) as? String else {
                 return nil
             }
-            var rectangle = CGRect.zero
-            guard CGRectMakeWithDictionaryRepresentation(bounds as CFDictionary, &rectangle),
-                  rectangle.width > 0,
-                  rectangle.height > 0 else {
+            let identifier = copyAttribute(element, kAXIdentifierAttribute) as? String
+            // Do not ask the private bridge for unrelated helper windows. A
+            // failure to expose one of those elements must not make an
+            // otherwise uniquely identifiable target fail closed.
+            guard title == target.title,
+                  identifier == target.identifier else {
                 return nil
             }
+            let windowID = try windowIDBridge.windowID(for: element)
             return WorkspaceWindowCandidate(
-                windowID: windowID,
-                bundleIdentifier: bundleIdentifier,
-                processID: processID,
+                windowID: UInt32(windowID),
+                bundleIdentifier: target.bundleIdentifier,
+                processID: target.processID,
                 title: title,
-                frame: SceneFrame(
-                    x: rectangle.origin.x,
-                    y: rectangle.origin.y,
-                    width: rectangle.width,
-                    height: rectangle.height
-                )
+                identifier: identifier,
+                frame: readFrame(from: element)
             )
         }
+    }
+
+    private func copyAttribute(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
+            return nil
+        }
+        return value
+    }
+
+    private func readFrame(from element: AXUIElement) -> SceneFrame? {
+        guard let positionReference = copyAttribute(element, kAXPositionAttribute),
+              let sizeReference = copyAttribute(element, kAXSizeAttribute),
+              CFGetTypeID(positionReference) == AXValueGetTypeID(),
+              CFGetTypeID(sizeReference) == AXValueGetTypeID() else {
+            return nil
+        }
+        let position = positionReference as! AXValue
+        let size = sizeReference as! AXValue
+        var point = CGPoint.zero
+        var cgSize = CGSize.zero
+        guard AXValueGetValue(position, .cgPoint, &point),
+              AXValueGetValue(size, .cgSize, &cgSize),
+              point.x.isFinite,
+              point.y.isFinite,
+              cgSize.width.isFinite,
+              cgSize.height.isFinite,
+              cgSize.width > 0,
+              cgSize.height > 0 else {
+            return nil
+        }
+        return SceneFrame(
+            x: point.x,
+            y: point.y,
+            width: cgSize.width,
+            height: cgSize.height
+        )
     }
 
 }

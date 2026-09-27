@@ -7,12 +7,13 @@ Space UUID` を持つworkspace contextに所属させる。表示・保存・復
 contextが一致する場合だけ許可する。Spaceのid64は同一性ではなく、実行時の
 window membership検証に使う。
 
-Space情報の取得はSkyLightを読み取り専用で遅延ロードし、次の3シンボルだけを
-使用する。
+Space情報の取得はSkyLightとAccessibilityの読み取り専用シンボルを遅延ロードし、
+次の4シンボルだけを使用する。
 
 - `SLSMainConnectionID`
 - `SLSCopyManagedDisplaySpaces`
 - `SLSCopySpacesForWindows`
+- `_AXUIElementGetWindow`
 
 Spaceの作成・移動・削除APIは使用しない。取得不能、構造不正、対象windowの
 outside/multiple/missingはfail closedとし、AX writeを行わない。
@@ -20,11 +21,17 @@ outside/multiple/missingはfail closedとし、AX writeを行わない。
 ## Why
 
 Space番号は再起動やdisplay変更で再採番され得るため、UIのスコープキーには
-UUIDを使う。保存・復元時はCGWindowListのlayer/sharing/boundsとbundle/PID/title
-で候補を絞り、同じidentityの候補が複数ある場合だけ保存frameの近似で一意化する。
+UUIDを使う。保存・復元時はAccessibilityの対象アプリ・PIDのwindow listから
+title+identifierで候補を絞り、同じidentityの候補が複数ある場合だけ保存frameの
+近似で一意化する。解決した生AXUIElementから読み取り専用の`_AXUIElementGetWindow`
+でCGWindowIDを取得し、そのIDだけをSkyLightのmembership確認へ渡す。
 候補が1件なら、ユーザーが保存後に移動・リサイズしていても採用する。そのうえで
 SkyLightのmembershipで現在Spaceとの一致を再確認する。これにより別Spaceのwindowを
 推測して操作しない。
+
+CGWindowListのtitleやframeはScreen Recordingの権限・プライバシー保護でredactされ
+得るため、Space membershipの解決には使用しない。AX解決、window ID取得、membershipの
+いずれかが不明な場合は保存・復元を停止し、AX writeを行わない。
 
 active sceneと並び順もSpace scopeごとに管理し、Spaceを切り替えても別scopeの
 active sceneをhideしたり、別scopeのsceneを隣接移動の対象にしたりしない。AX操作は
@@ -37,7 +44,7 @@ AX writeを一つの原子操作としてロックする公開手段はないた
 ## Why not
 
 Space番号の直接管理、他Spaceへのwindow移動、CGWindowListの全デスクトップ画像
-取得、非公開の移動/作成APIは採用しない。公開APIだけでは他アプリのSpace所属を
+取得、非公開のSpace移動/作成APIは採用しない。公開APIだけでは他アプリのSpace所属を
 正確に取得できず、推測による復元は誤操作とプライバシー漏えいにつながる。
 
 ## Distribution and re-evaluation
