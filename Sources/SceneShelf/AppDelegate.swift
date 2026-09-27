@@ -1031,41 +1031,6 @@ struct ShelfView: View {
             .padding(.vertical, 8)
             .sceneShelfGlassSurface(.header)
 
-            if viewModel.cards.isEmpty {
-                Text("シーンがありません")
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("シーンがありません")
-            } else {
-                ForEach(viewModel.cards) { card in
-                    Button {
-                        viewModel.click(sceneID: card.id)
-                    } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: card.state == .displayed ? "rectangle.inset.filled" : "rectangle")
-                                .frame(width: 18)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(card.name)
-                                    .font(.body.weight(.medium))
-                                Text(card.state.japaneseLabel)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.tertiary)
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .sceneShelfGlassSurface(.card)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("\(card.name)・\(card.state.japaneseLabel)")
-                    .accessibilityIdentifier("scene-card-\(card.id)")
-                }
-            }
-
             if !viewModel.savedCards.isEmpty {
                 Divider()
                 Text("保存済み配置")
@@ -1485,14 +1450,9 @@ final class SceneShelfAppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let coordinator = SceneCoordinator(
-            scenes: FakeSceneFactory.defaultScenes,
-            operation: { _, _ in
-                // A deterministic delay keeps `準備中` and busy rejection
-                // observable during the P0-1 manual click walkthrough.
-                try? await Task.sleep(nanoseconds: 400_000_000)
-            }
-        )
+        // The product shelf is populated exclusively from persisted scenes.
+        // FakeSceneFactory remains available to the core test runners only.
+        let coordinator = SceneCoordinator(scenes: [])
         let viewModel = ShelfViewModel(
             coordinator: coordinator,
             sceneStore: InMemorySceneStore(persistence: persistence),
