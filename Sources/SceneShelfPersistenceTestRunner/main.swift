@@ -39,7 +39,11 @@ struct SceneShelfPersistenceTestRunner {
         try await testApplicationSupportInitializationFailureFailsClosed()
         try testProcessLockRejectsIndependentSecondAcquisitionAndReleases()
         try await testProcessLockDoesNotInterfereWithPersistenceFiles()
-        print("SceneShelfPersistenceTestRunner: PASS (28 tests)")
+        try testThumbnailWindowResolutionRequiresOneExactOwnerMatch()
+        try testThumbnailCompositeUsesSavedFrameLayoutAndBoundedResolution()
+        try testThumbnailCachePublishesAtomicPNGAndPreservesPreviousOnFailure()
+        try testThumbnailCacheSupportsDuplicateDeleteAndUpdate()
+        print("SceneShelfPersistenceTestRunner: PASS (32 tests)")
     }
 
     private static func testEmptyStoreDoesNotCreateFiles() async throws {
@@ -869,6 +873,149 @@ struct SceneShelfPersistenceTestRunner {
             loaded.scenes.first?.name == "ロック中の保存",
             "JSON persistence should ignore the separate lock file"
         )
+    }
+
+    private static func testThumbnailWindowResolutionRequiresOneExactOwnerMatch() throws {
+        let identity = SceneWindowIdentity(
+            bundleIdentifier: "com.example.editor",
+            processID: 42,
+            title: "Document"
+        )
+        let candidates = [
+            SceneThumbnailWindowDescriptor(
+                bundleIdentifier: "com.example.editor",
+                processID: 42,
+                title: "Document"
+            ),
+            SceneThumbnailWindowDescriptor(
+                bundleIdentifier: "com.example.editor",
+                processID: 42,
+                title: "Other"
+            )
+        ]
+        try expect(
+            SceneThumbnailWindowResolution.resolve(identity: identity, candidates: candidates) == .unique,
+            "thumbnail capture should resolve one exact bundle/PID/title match"
+        )
+        try expect(
+            SceneThumbnailWindowResolution.resolve(identity: identity, candidates: []) == .missing,
+            "thumbnail capture should not capture when the saved window is missing"
+        )
+        try expect(
+            SceneThumbnailWindowResolution.resolve(identity: identity, candidates: candidates + [candidates[0]]) == .ambiguous,
+            "thumbnail capture should not guess when exact matches are ambiguous"
+        )
+        try expect(
+            SceneThumbnailCaptureSizing.outputSize(
+                for: SceneFrame(x: 0, y: 0, width: 800, height: 600)
+            ) == SceneThumbnailSize(width: 373, height: 280),
+            "thumbnail capture configuration should stay within the 400x280 bound while preserving aspect"
+        )
+        let savedFrame = SceneFrame(x: 950, y: 54, width: 2_009, height: 1_543)
+        let regular = SceneThumbnailWindowDescriptor(
+            bundleIdentifier: identity.bundleIdentifier,
+            processID: identity.processID,
+            title: identity.title,
+            frame: savedFrame,
+            windowLayer: 0,
+            sharingState: 1
+        )
+        let helperWindow = SceneThumbnailWindowDescriptor(
+            bundleIdentifier: identity.bundleIdentifier,
+            processID: identity.processID,
+            title: identity.title,
+            frame: SceneFrame(x: -340, y: -124, width: 1_128, height: 3_149),
+            windowLayer: 3,
+            sharingState: 1
+        )
+        try expect(
+            SceneThumbnailWindowResolution.resolve(
+                identity: identity,
+                candidates: [helperWindow, regular],
+                savedFrame: savedFrame
+            ) == .unique,
+            "saved frame should disambiguate a regular window from a helper window"
+        )
+        try expect(
+            SceneThumbnailWindowResolution.capturableCandidates([helperWindow, regular]) == [regular],
+            "CoreGraphics fallback should exclude nonzero-layer helper windows"
+        )
+    }
+
+    private static func testThumbnailCompositeUsesSavedFrameLayoutAndBoundedResolution() throws {
+        let first = SceneWindowIdentity(bundleIdentifier: "com.example.editor", processID: 42, title: "First")
+        let second = SceneWindowIdentity(bundleIdentifier: "com.example.editor", processID: 42, title: "Second")
+        let scene = SavedScene(
+            id: "scene-thumb",
+            name: "サムネイル",
+            windows: [
+                SceneWindowSnapshot(
+                    identity: first,
+                    frame: SceneFrame(x: 0, y: 0, width: 100, height: 100),
+                    isMinimized: false
+                ),
+                SceneWindowSnapshot(
+                    identity: second,
+                    frame: SceneFrame(x: 100, y: 50, width: 200, height: 50),
+                    isMinimized: false
+                )
+            ]
+        )
+        let red = SceneThumbnailImage.solidColor(width: 2, height: 2, rgba: [255, 0, 0, 255])
+        let blue = SceneThumbnailImage.solidColor(width: 2, height: 2, rgba: [0, 0, 255, 255])
+        let composite = try SceneThumbnailComposer.compose(
+            scene: scene,
+            images: [first: red, second: blue],
+            maximumSize: SceneThumbnailSize(width: 400, height: 280)
+        )
+        try expect(composite.width == 400, "composite should use the largest bounded width")
+        try expect(composite.height == 133, "composite should preserve the saved union aspect ratio")
+        try expect(
+            composite.rgbaData.count == composite.width * composite.height * 4,
+            "composite should expose a complete RGBA raster"
+        )
+        try expect(
+            composite.rgbaData.first == 255 && composite.rgbaData.dropFirst(2).first == 0,
+            "first saved frame should occupy the leading composite pixels"
+        )
+        let bluePixelOffset = ((100 * composite.width) + 250) * 4
+        try expect(
+            composite.rgbaData[bluePixelOffset] == 0 && composite.rgbaData[bluePixelOffset + 2] == 255,
+            "second saved frame should retain its relative position and color"
+        )
+    }
+
+    private static func testThumbnailCachePublishesAtomicPNGAndPreservesPreviousOnFailure() throws {
+        let root = try makeTemporaryRoot()
+        defer { removeTemporaryRoot(root) }
+        let cache = SceneThumbnailCache(rootURL: root)
+        let oldData = Data("old-thumbnail".utf8)
+        try cache.write(oldData, sceneID: "scene-1")
+        let path = try cache.url(for: "scene-1")
+        try expect(fileManager.fileExists(atPath: path.path), "thumbnail cache should publish the expected safe PNG path")
+        try expect(try cache.read(sceneID: "scene-1") == oldData, "thumbnail cache should read the published bytes")
+
+        let failingCache = SceneThumbnailCache(rootURL: root, fault: .beforeRename)
+        do {
+            try failingCache.write(Data("new-thumbnail".utf8), sceneID: "scene-1")
+            throw TestFailure(description: "faulted thumbnail write unexpectedly succeeded")
+        } catch let error as SceneThumbnailCacheError {
+            try expect(error == .atomicWriteFailed, "faulted thumbnail write should report atomic failure")
+        }
+        try expect(try cache.read(sceneID: "scene-1") == oldData, "failed thumbnail write must preserve the previous image")
+    }
+
+    private static func testThumbnailCacheSupportsDuplicateDeleteAndUpdate() throws {
+        let root = try makeTemporaryRoot()
+        defer { removeTemporaryRoot(root) }
+        let cache = SceneThumbnailCache(rootURL: root)
+        try cache.write(Data("source".utf8), sceneID: "scene-1")
+        try cache.copy(from: "scene-1", to: "scene-2")
+        try expect(try cache.read(sceneID: "scene-2") == Data("source".utf8), "duplicating a scene should copy its cached thumbnail")
+        try cache.write(Data("updated".utf8), sceneID: "scene-1")
+        try expect(try cache.read(sceneID: "scene-1") == Data("updated".utf8), "explicit thumbnail update should replace the image")
+        try cache.remove(sceneID: "scene-2")
+        try expect(try cache.read(sceneID: "scene-2") == nil, "deleting a scene should remove its cached thumbnail")
     }
 
     private static func persistedStore(at root: URL) async throws -> InMemorySceneStore {

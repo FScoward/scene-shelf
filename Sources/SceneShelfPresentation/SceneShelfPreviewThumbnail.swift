@@ -1,13 +1,20 @@
+import AppKit
 import SwiftUI
 
 /// Draws saved window rectangles without reading pixels from any application.
 public struct SceneShelfPreviewThumbnail: View {
     private let preview: SceneShelfPreview
     private let isDisplayed: Bool
+    private let thumbnailData: Data?
 
-    public init(preview: SceneShelfPreview, isDisplayed: Bool = false) {
+    public init(
+        preview: SceneShelfPreview,
+        isDisplayed: Bool = false,
+        thumbnailData: Data? = nil
+    ) {
         self.preview = preview
         self.isDisplayed = isDisplayed
+        self.thumbnailData = thumbnailData
     }
 
     public var body: some View {
@@ -15,28 +22,37 @@ public struct SceneShelfPreviewThumbnail: View {
             ZStack(alignment: .topLeading) {
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
                     .fill(.black.opacity(0.14))
-                if preview.windows.isEmpty {
-                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .stroke(.white.opacity(0.28), lineWidth: 1)
-                        .padding(13)
+                if let thumbnailData,
+                   let image = NSImage(data: thumbnailData) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.medium)
+                        .scaledToFit()
+                        .padding(4)
                 } else {
-                    let canvas = SceneShelfPreviewPresentation.contentRect(
-                        for: preview,
-                        in: geometry.size
-                    )
-                    ForEach(Array(preview.windows.enumerated()), id: \.offset) { index, window in
-                        let frame = thumbnailFrame(
-                            for: window.frame,
-                            in: canvas.size
+                    if preview.windows.isEmpty {
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .stroke(.white.opacity(0.28), lineWidth: 1)
+                            .padding(13)
+                    } else {
+                        let canvas = SceneShelfPreviewPresentation.contentRect(
+                            for: preview,
+                            in: geometry.size
                         )
-                        RoundedRectangle(cornerRadius: 3, style: .continuous)
-                            .fill(windowTint(for: index))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 3, style: .continuous)
-                                    .stroke(.white.opacity(0.72), lineWidth: 0.7)
+                        ForEach(Array(preview.windows.enumerated()), id: \.offset) { index, window in
+                            let frame = thumbnailFrame(
+                                for: window.frame,
+                                in: canvas.size
                             )
-                            .frame(width: frame.width, height: frame.height)
-                            .offset(x: canvas.minX + frame.minX, y: canvas.minY + frame.minY)
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .fill(windowTint(for: index))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                        .stroke(.white.opacity(0.72), lineWidth: 0.7)
+                                )
+                                .frame(width: frame.width, height: frame.height)
+                                .offset(x: canvas.minX + frame.minX, y: canvas.minY + frame.minY)
+                        }
                     }
                 }
             }

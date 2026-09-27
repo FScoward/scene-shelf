@@ -102,6 +102,7 @@ struct SceneShelfPresentationTestRunner {
         runTest(testApplicationCatalogPresentationBoundary)
         runTest(testApplicationCatalogWindowRowsAndPermissionRevocation)
         runTest(testApplicationCatalogSelectionPresentation)
+        runTest(testThumbnailPresentationUsesRealImageBeforeFallback)
 
         if failures == 0 {
             print("SceneShelfPresentationTestRunner: \(executedTests) tests passed")
@@ -1128,6 +1129,24 @@ struct SceneShelfPresentationTestRunner {
             "application selection label explains the saved target in Japanese"
         )
         expect(row.isSelectable, "unique application window row is selectable")
+    }
+
+    private static func testThumbnailPresentationUsesRealImageBeforeFallback() {
+        let fallback = SceneShelfPreview(sceneID: "scene-thumb", windows: [])
+        let missing = SceneShelfThumbnailPresentation.content(
+            sceneID: "scene-thumb",
+            thumbnailData: [:],
+            fallback: fallback
+        )
+        expect(missing == .fallback(fallback), "missing thumbnail data should keep the existing layout fallback")
+
+        let data = Data("thumbnail".utf8)
+        let real = SceneShelfThumbnailPresentation.content(
+            sceneID: "scene-thumb",
+            thumbnailData: ["scene-thumb": data],
+            fallback: fallback
+        )
+        expect(real == .image(data), "available thumbnail data should cross the UI boundary as a real image")
     }
 
     private static func sendClick(to window: NSWindow, at point: NSPoint) {

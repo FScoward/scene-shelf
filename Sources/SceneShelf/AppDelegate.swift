@@ -47,6 +47,8 @@ final class ShelfViewModel: ObservableObject {
     @Published private(set) var cards: [SceneCardSnapshot] = []
     @Published private(set) var savedCards: [SceneCardSnapshot] = []
     @Published private(set) var savedScenePreviews: [SceneID: SceneShelfPreview] = [:]
+    @Published private(set) var savedSceneThumbnailData: [SceneID: Data] = [:]
+    @Published private(set) var savedSceneThumbnailStates: [SceneID: SceneThumbnailState] = [:]
     @Published private(set) var savedCardFailureMessages: [SceneID: String] = [:]
     @Published private(set) var persistenceDiagnosticRows: [SceneShelfPersistenceDiagnosticRow] = []
     @Published private(set) var statusMessage = "クリックでシーンを切り替えます"
@@ -79,6 +81,8 @@ final class ShelfViewModel: ObservableObject {
     private let accessibilityAdapter: any AXWindowAdapter
     private let backgroundWindowCoordinator = AXWindowIsolationCoordinator()
     private let persistenceInitializationError: ScenePersistenceError?
+    private let thumbnailCache: SceneThumbnailCache?
+    private let thumbnailCaptureService: any SceneThumbnailCapturing
 
     private struct DefaultSceneStore {
         let store: InMemorySceneStore
@@ -106,10 +110,19 @@ final class ShelfViewModel: ObservableObject {
         }
     }
 
+    private static func makeDefaultThumbnailCache() -> SceneThumbnailCache? {
+        guard let persistence = try? SceneShelfPersistence.applicationSupport() else {
+            return nil
+        }
+        return SceneThumbnailCache(rootURL: persistence.rootURL)
+    }
+
     init(
         coordinator: SceneCoordinator,
         sceneStore: InMemorySceneStore? = nil,
-        accessibilityAdapter: any AXWindowAdapter = AXSystemAdapter()
+        accessibilityAdapter: any AXWindowAdapter = AXSystemAdapter(),
+        thumbnailCache: SceneThumbnailCache? = nil,
+        thumbnailCaptureService: any SceneThumbnailCapturing = ScreenCaptureKitThumbnailCaptureService()
     ) {
         self.coordinator = coordinator
         if let sceneStore {
@@ -121,6 +134,8 @@ final class ShelfViewModel: ObservableObject {
             self.persistenceInitializationError = defaultSceneStore.initializationError
         }
         self.accessibilityAdapter = accessibilityAdapter
+        self.thumbnailCache = thumbnailCache ?? Self.makeDefaultThumbnailCache()
+        self.thumbnailCaptureService = thumbnailCaptureService
         Task { @MainActor [weak self] in
             await self?.loadPersistedScenes()
             await self?.refresh()
@@ -185,6 +200,68 @@ final class ShelfViewModel: ObservableObject {
         let scenes = await sceneStore.scenes()
         savedCards = await sceneStore.cards()
         savedScenePreviews = SceneShelfPreviewPresentation.previews(for: scenes)
+        var thumbnailData: [SceneID: Data] = [:]
+        var thumbnailStates: [SceneID: SceneThumbnailState] = [:]
+        for scene in scenes {
+            if let thumbnailCache {
+                do {
+                    if let data = try thumbnailCache.read(sceneID: scene.id) {
+                        thumbnailData[scene.id] = data
+                        thumbnailStates[scene.id] = .available
+                        continue
+                    }
+                } catch {
+                    // A corrupt cache is a derived-data problem; keep the
+                    // saved scene usable with its deterministic layout.
+                }
+            }
+            thumbnailStates[scene.id] = .fallback
+        }
+        savedSceneThumbnailData = thumbnailData
+        savedSceneThumbnailStates = thumbnailStates
+    }
+
+    @discardableResult
+    private func captureThumbnail(for scene: SavedScene) async -> Bool {
+        guard let thumbnailCache else {
+            savedSceneThumbnailStates[scene.id] = .failed("配置プレビューの保存先を準備できませんでした")
+            return false
+        }
+        savedSceneThumbnailStates[scene.id] = .loading
+        do {
+            let data = try await thumbnailCaptureService.capture(scene: scene)
+            try thumbnailCache.write(data, sceneID: scene.id)
+            savedSceneThumbnailData[scene.id] = data
+            savedSceneThumbnailStates[scene.id] = .available
+            return true
+        } catch let error as SceneThumbnailCaptureError {
+            savedSceneThumbnailStates[scene.id] = .failed(error.japaneseLabel)
+            sceneManagementMessage = error.japaneseLabel
+            return false
+        } catch let error as SceneThumbnailCacheError {
+            savedSceneThumbnailStates[scene.id] = .failed(error.japaneseLabel)
+            sceneManagementMessage = error.japaneseLabel
+            return false
+        } catch {
+            savedSceneThumbnailStates[scene.id] = .failed("配置プレビューを更新できませんでした")
+            sceneManagementMessage = "配置プレビューを更新できませんでした"
+            return false
+        }
+    }
+
+    func updateSavedSceneThumbnail(sceneID: SceneID) {
+        let store = sceneStore
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let scene = await store.scene(sceneID: sceneID) else {
+                sceneManagementMessage = SceneManagementError.sceneNotFound(sceneID).japaneseLabel
+                return
+            }
+            await captureThumbnail(for: scene)
+            if savedSceneThumbnailStates[sceneID] == .available {
+                sceneManagementMessage = "配置プレビューを更新しました"
+            }
+        }
     }
 
     func click(sceneID: SceneID) {
@@ -252,12 +329,13 @@ final class ShelfViewModel: ObservableObject {
                 let selected = Set(
                     preparation.selectedIDs.map { SceneWindowIdentity(from: $0) }
                 )
-                _ = try await store.save(
+                let savedScene = try await store.save(
                     name: name,
                     candidates: candidates,
                     selectedIDs: selected
                 )
                 guard let self else { return }
+                await captureThumbnail(for: savedScene)
                 accessibilityMessage = "現在のFixture配置をローカルに保存しました"
                 await refresh()
             } catch let error as AXSceneCaptureError {
@@ -341,9 +419,12 @@ final class ShelfViewModel: ObservableObject {
             }
             let candidates = discovery.windows.compactMap(Self.sceneSnapshot(from:))
             do {
-                _ = try await store.overwrite(sceneID: sceneID, candidates: candidates)
+                let overwritten = try await store.overwrite(sceneID: sceneID, candidates: candidates)
                 guard let self else { return }
-                sceneManagementMessage = "現在の配置で上書きしました"
+                let previewCaptured = await captureThumbnail(for: overwritten)
+                if previewCaptured {
+                    sceneManagementMessage = "現在の配置で上書きしました"
+                }
                 await refresh()
             } catch {
                 guard let self else { return }
@@ -356,8 +437,19 @@ final class ShelfViewModel: ObservableObject {
         let store = sceneStore
         Task { @MainActor [weak self] in
             do {
-                _ = try await store.duplicate(sceneID: sceneID)
+                let duplicate = try await store.duplicate(sceneID: sceneID)
                 guard let self else { return }
+                if let thumbnailCache {
+                    do {
+                        try thumbnailCache.copy(from: sceneID, to: duplicate.id)
+                        if let data = try thumbnailCache.read(sceneID: duplicate.id) {
+                            savedSceneThumbnailData[duplicate.id] = data
+                            savedSceneThumbnailStates[duplicate.id] = .available
+                        }
+                    } catch {
+                        savedSceneThumbnailStates[duplicate.id] = .fallback
+                    }
+                }
                 sceneManagementMessage = "配置を複製しました"
                 await refresh()
             } catch {
@@ -405,6 +497,9 @@ final class ShelfViewModel: ObservableObject {
             do {
                 try await store.delete(sceneID: sceneID, confirmed: true)
                 guard let self else { return }
+                try? thumbnailCache?.remove(sceneID: sceneID)
+                savedSceneThumbnailData.removeValue(forKey: sceneID)
+                savedSceneThumbnailStates.removeValue(forKey: sceneID)
                 sceneManagementMessage = "配置を削除しました"
                 await refresh()
             } catch {
@@ -580,11 +675,12 @@ final class ShelfViewModel: ObservableObject {
                 let selected = Set(
                     preparation.selectedIDs.map { SceneWindowIdentity(from: $0) }
                 )
-                _ = try await store.save(
+                let savedScene = try await store.save(
                     name: name,
                     candidates: sceneCandidates,
                     selectedIDs: selected
                 )
+                await captureThumbnail(for: savedScene)
                 selectedApplicationWindowIDs = []
                 applicationCatalogMessage = "選択したアプリ配置をローカルに保存しました"
                 await refresh()
@@ -1007,7 +1103,8 @@ struct ShelfView: View {
                                         SceneShelfPreviewThumbnail(
                                             preview: viewModel.savedScenePreviews[card.id]
                                                 ?? SceneShelfPreview(sceneID: card.id, windows: []),
-                                            isDisplayed: card.state == .displayed
+                                            isDisplayed: card.state == .displayed,
+                                            thumbnailData: viewModel.savedSceneThumbnailData[card.id]
                                         )
                                         VStack(alignment: .leading, spacing: 3) {
                                             Text(card.name)
@@ -1057,6 +1154,10 @@ struct ShelfView: View {
                                     viewModel.overwriteSavedScene(sceneID: card.id)
                                 }
                                 .accessibilityIdentifier("saved-scene-menu-overwrite-\(card.id)")
+                                Button("プレビューを更新") {
+                                    viewModel.updateSavedSceneThumbnail(sceneID: card.id)
+                                }
+                                .accessibilityIdentifier("saved-scene-menu-refresh-thumbnail-\(card.id)")
                                 Button("複製") {
                                     viewModel.duplicateSavedScene(sceneID: card.id)
                                 }

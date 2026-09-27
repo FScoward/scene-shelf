@@ -24,5 +24,7 @@
 	<true/>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>保存済み配置の一覧に実ウィンドウのプレビューを表示するために画面収録を使用します。</string>
 </dict>
 </plist>

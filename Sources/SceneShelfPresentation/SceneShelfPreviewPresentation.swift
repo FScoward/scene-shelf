@@ -59,6 +59,24 @@ public struct SceneShelfPreview: Equatable, Sendable, Identifiable {
     }
 }
 
+public enum SceneShelfThumbnailContent: Equatable, Sendable {
+    case image(Data)
+    case fallback(SceneShelfPreview)
+}
+
+public enum SceneShelfThumbnailPresentation {
+    public static func content(
+        sceneID: SceneID,
+        thumbnailData: [SceneID: Data],
+        fallback: SceneShelfPreview
+    ) -> SceneShelfThumbnailContent {
+        guard let data = thumbnailData[sceneID], !data.isEmpty else {
+            return .fallback(fallback)
+        }
+        return .image(data)
+    }
+}
+
 /// Builds a deterministic, privacy-preserving visual summary from saved frames.
 public enum SceneShelfPreviewPresentation {
     public static func preview(for scene: SavedScene) -> SceneShelfPreview {
