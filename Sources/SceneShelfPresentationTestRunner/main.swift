@@ -914,12 +914,6 @@ struct SceneShelfPresentationTestRunner {
             "non-cleanup delete failures do not refresh as if the record were removed"
         )
 
-        let unsupportedOverwrite = SceneManagementError.applicationOverwriteUnsupported
-        expect(
-            SceneShelfManagementPresentation.message(for: unsupportedOverwrite)
-                .contains("一般アプリ配置の上書きは未対応"),
-            "generic overwrite keeps an explicit Japanese unsupported message"
-        )
     }
 
     private static func testPersistenceDiagnosticPresentationBoundary() {

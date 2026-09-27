@@ -751,11 +751,6 @@ public actor InMemorySceneStore {
             throw SceneManagementError.sceneNotFound(sceneID)
         }
         let current = storedScenes[sceneIndex]
-        guard current.windows.allSatisfy({
-            $0.identity.bundleIdentifier == SceneMatcher.fixtureBundleIdentifier
-        }) else {
-            throw SceneManagementError.applicationOverwriteUnsupported
-        }
         guard Set(current.windows.map(\.identity)).count == current.windows.count else {
             throw SceneManagementError.targetUnavailable(.ambiguousMatch)
         }
@@ -783,7 +778,7 @@ public actor InMemorySceneStore {
             id: current.id,
             name: current.name,
             windows: updatedWindows,
-            workspaceContext: currentContext ?? current.workspaceContext
+            workspaceContext: current.workspaceContext
         )
         try validateWindowMembership(overwritten.windows, context: overwritten.workspaceContext)
         let currentRevision = persistenceEntries[sceneID]?.revision ?? 0

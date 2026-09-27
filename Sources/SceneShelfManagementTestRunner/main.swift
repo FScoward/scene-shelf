@@ -23,8 +23,11 @@ struct SceneShelfManagementTestRunner {
         await run("overwrite rejects an incomplete live snapshot without mutation") {
             try await testOverwriteRejectsIncompleteLiveSnapshotWithoutMutation()
         }
-        await run("overwrite rejects generic application scenes without mutation") {
-            try await testOverwriteRejectsGenericApplicationSceneWithoutMutation()
+        await run("overwrite updates generic application scenes without changing targets") {
+            try await testOverwriteUpdatesGenericApplicationSceneWithoutChangingTargets()
+        }
+        await run("overwrite rejects an ambiguous generic snapshot without mutation") {
+            try await testOverwriteRejectsAmbiguousGenericSnapshotWithoutMutation()
         }
         await run("duplicate gets a unique deep-copied stashed scene") {
             try await testDuplicateGetsUniqueDeepCopiedStashedScene()
@@ -58,7 +61,7 @@ struct SceneShelfManagementTestRunner {
         }
 
         if failures == 0 {
-            print("SceneShelfManagementTestRunner: PASS (15 tests)")
+            print("SceneShelfManagementTestRunner: PASS (16 tests)")
         } else {
             print("SceneShelfManagementTestRunner: \(failures) failures")
             Foundation.exit(1)
@@ -142,7 +145,44 @@ struct SceneShelfManagementTestRunner {
         try expect(loaded.indexEntries.first?.revision == 1, "failed overwrite must keep current revision")
     }
 
-    private static func testOverwriteRejectsGenericApplicationSceneWithoutMutation() async throws {
+    private static func testOverwriteUpdatesGenericApplicationSceneWithoutChangingTargets() async throws {
+        let root = try makeTemporaryRoot()
+        defer { removeTemporaryRoot(root) }
+        let store = try await persistedStore(at: root)
+        let application = SceneWindowSnapshot(
+            identity: SceneWindowIdentity(
+                bundleIdentifier: "com.example.Editor",
+                processID: 701,
+                title: "Draft",
+                identifier: "draft"
+            ),
+            frame: SceneFrame(x: 20, y: 30, width: 640, height: 480),
+            isMinimized: false
+        )
+        let scene = try await store.save(
+            name: "一般アプリ配置",
+            candidates: [application],
+            selectedIDs: [application.identity]
+        )
+        let changed = SceneWindowSnapshot(
+            identity: application.identity,
+            frame: SceneFrame(x: 120, y: 140, width: 900, height: 700),
+            isMinimized: true
+        )
+
+        let overwritten = try await store.overwrite(sceneID: scene.id, candidates: [changed])
+        try expect(overwritten.id == scene.id, "generic overwrite must keep scene ID")
+        try expect(overwritten.name == scene.name, "generic overwrite must keep scene name")
+        try expect(overwritten.windows.map(\.identity) == scene.windows.map(\.identity), "generic overwrite must preserve target identity and order")
+        try expect(overwritten.windows.first?.frame == changed.frame, "generic overwrite should capture the live frame")
+        try expect(overwritten.windows.first?.isMinimized == changed.isMinimized, "generic overwrite should capture minimized state")
+
+        let loaded = try SceneShelfPersistence(rootURL: root).load()
+        try expect(loaded.indexEntries.first?.revision == 2, "generic overwrite should commit revision plus one")
+        try expect(loaded.scenes.first == overwritten, "generic overwrite should persist the updated scene")
+    }
+
+    private static func testOverwriteRejectsAmbiguousGenericSnapshotWithoutMutation() async throws {
         let root = try makeTemporaryRoot()
         defer { removeTemporaryRoot(root) }
         let store = try await persistedStore(at: root)
@@ -163,14 +203,19 @@ struct SceneShelfManagementTestRunner {
         )
         let before = await store.scenes()
         let beforeIndex = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        let duplicate = SceneWindowSnapshot(
+            identity: application.identity,
+            frame: SceneFrame(x: 120, y: 140, width: 900, height: 700),
+            isMinimized: true
+        )
 
-        try await expectManagementError(.applicationOverwriteUnsupported) {
-            _ = try await store.overwrite(sceneID: scene.id, candidates: [application])
+        try await expectManagementError(.targetUnavailable(.ambiguousMatch)) {
+            _ = try await store.overwrite(sceneID: scene.id, candidates: [application, duplicate])
         }
         let after = await store.scenes()
-        try expect(after == before, "generic overwrite must preserve scene memory")
+        try expect(after == before, "ambiguous generic overwrite must preserve scene memory")
         let afterIndex = try Data(contentsOf: root.appendingPathComponent("index.json"))
-        try expect(afterIndex == beforeIndex, "generic overwrite must preserve persisted scene")
+        try expect(afterIndex == beforeIndex, "ambiguous generic overwrite must preserve persisted scene")
     }
 
     private static func testDuplicateGetsUniqueDeepCopiedStashedScene() async throws {

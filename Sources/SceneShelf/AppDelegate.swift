@@ -486,22 +486,19 @@ final class ShelfViewModel: ObservableObject {
                 sceneManagementMessage = SceneManagementError.sceneNotFound(sceneID).japaneseLabel
                 return
             }
-            guard scene.windows.allSatisfy({
-                $0.identity.bundleIdentifier == SceneMatcher.fixtureBundleIdentifier
-            }) else {
-                guard let self else { return }
-                sceneManagementMessage = SceneManagementError.applicationOverwriteUnsupported.japaneseLabel
-                return
-            }
-            let discovery = await adapter.fixtureWindowResult()
-            if let failureReason = discovery.failureReason {
+            let discovery = await Self.discoverOverwriteCandidates(
+                for: scene,
+                adapter: adapter
+            )
+            if case let .failure(failureReason) = discovery {
                 guard let self else { return }
                 sceneManagementMessage = SceneShelfAXPresentation.overwriteFailureMessage(
                     for: failureReason
                 )
                 return
             }
-            let candidates = discovery.windows.compactMap(Self.sceneSnapshot(from:))
+            guard case let .success(discoveredWindows) = discovery else { return }
+            let candidates = discoveredWindows.compactMap(Self.sceneSnapshot(from:))
             do {
                 let overwritten = try await store.overwrite(sceneID: sceneID, candidates: candidates)
                 guard let self else { return }
@@ -1020,6 +1017,34 @@ final class ShelfViewModel: ObservableObject {
             frame: SceneFrame(from: frame),
             isMinimized: window.isMinimized
         )
+    }
+
+    /// Discovers each saved target application's windows once, then combines
+    /// the copied AX values into the candidate set consumed by the pure store.
+    /// The saved target identities remain the allowlist; discovery never adds
+    /// a window to the scene by itself. A discovery failure aborts the whole
+    /// collection so the subsequent overwrite can remain atomic.
+    nonisolated private static func discoverOverwriteCandidates(
+        for scene: SavedScene,
+        adapter: any AXWindowAdapter
+    ) async -> Result<[AXWindowSnapshot], FailureReason> {
+        let targets = scene.windows.map { axIdentity(from: $0.identity) }
+        let applicationKeys = AXApplicationDiscovery.uniqueProcessIdentities(from: targets)
+        var candidates: [AXWindowSnapshot] = []
+        for key in applicationKeys {
+            guard let target = targets.first(where: {
+                $0.bundleIdentifier == key.bundleIdentifier
+                    && $0.processID == key.processID
+            }) else {
+                continue
+            }
+            let discovery = await adapter.windowResult(for: target)
+            if let failureReason = discovery.failureReason {
+                return .failure(failureReason)
+            }
+            candidates.append(contentsOf: discovery.windows)
+        }
+        return .success(candidates)
     }
 
     nonisolated private static func axIdentity(from identity: SceneWindowIdentity) -> AXWindowIdentity {
