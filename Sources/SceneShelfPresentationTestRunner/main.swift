@@ -94,6 +94,7 @@ struct SceneShelfPresentationTestRunner {
         runTest(testPrimaryButtonDisabledInteraction)
         runTest(testPanelScrollOperation)
         runTest(testShelfActivation)
+        runTest(testSavedSceneInteractionGate)
         runTest(testPrimaryCardHitArea)
         runTest(testStageManagerPreviewCardBoundary)
         runTest(testAXReasonPresentationBoundary)
@@ -806,6 +807,43 @@ struct SceneShelfPresentationTestRunner {
             "saved scene management menu click does not invoke the primary action"
         )
         window.orderOut(nil)
+    }
+
+    private static func testSavedSceneInteractionGate() {
+        let gate = SceneShelfInteractionGate()
+        let primary = gate.requestPrimary(sceneID: "scene-a")
+        let primaryThenManagement = gate.beginManagement(sceneID: "scene-a")
+        expect(
+            !gate.consumePrimary(primary),
+            "management action declared after primary request suppresses the same scene primary action"
+        )
+        gate.endManagement(primaryThenManagement)
+
+        let managementThenPrimary = gate.beginManagement(sceneID: "scene-a")
+        let blockedPrimary = gate.requestPrimary(sceneID: "scene-a")
+        expect(
+            !gate.consumePrimary(blockedPrimary),
+            "primary request declared during active management is suppressed"
+        )
+        gate.endManagement(managementThenPrimary)
+
+        let nextPrimary = gate.requestPrimary(sceneID: "scene-a")
+        expect(
+            gate.consumePrimary(nextPrimary),
+            "a primary request executes once after management ends"
+        )
+        expect(
+            !gate.consumePrimary(nextPrimary),
+            "a primary request cannot execute more than once"
+        )
+
+        let otherScenePrimary = gate.requestPrimary(sceneID: "scene-b")
+        let otherSceneManagement = gate.beginManagement(sceneID: "scene-a")
+        expect(
+            gate.consumePrimary(otherScenePrimary),
+            "management action for another scene does not suppress the primary request"
+        )
+        gate.endManagement(otherSceneManagement)
     }
 
     private static func testStageManagerPreviewCardBoundary() {

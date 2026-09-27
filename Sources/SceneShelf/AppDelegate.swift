@@ -109,7 +109,10 @@ final class ShelfViewModel: ObservableObject {
     private let thumbnailCache: SceneThumbnailCache?
     private let thumbnailCaptureService: any SceneThumbnailCapturing
     private let workspaceContextProvider: any WorkspaceContextProviding
+    private let savedSceneInteractionGate = SceneShelfInteractionGate()
     private var activeSpaceObserver: ActiveSpaceObserverToken?
+    private var renameManagementScope: SceneShelfInteractionGate.ManagementScope?
+    private var pendingDeleteManagementScope: SceneShelfInteractionGate.ManagementScope?
 
     private struct DefaultSceneStore {
         let store: InMemorySceneStore
@@ -331,8 +334,10 @@ final class ShelfViewModel: ObservableObject {
     }
 
     func updateSavedSceneThumbnail(sceneID: SceneID) {
+        let managementScope = savedSceneInteractionGate.beginManagement(sceneID: sceneID)
         let store = sceneStore
         Task { @MainActor [weak self] in
+            defer { self?.savedSceneInteractionGate.endManagement(managementScope) }
             guard let self else { return }
             guard let scene = await store.scene(sceneID: sceneID) else {
                 sceneManagementMessage = SceneManagementError.sceneNotFound(sceneID).japaneseLabel
@@ -442,15 +447,26 @@ final class ShelfViewModel: ObservableObject {
     }
 
     func beginRename(sceneID: SceneID) {
+        if let existingScope = renameManagementScope {
+            savedSceneInteractionGate.endManagement(existingScope)
+            renameManagementScope = nil
+        }
+        let managementScope = savedSceneInteractionGate.beginManagement(sceneID: sceneID)
         guard let card = savedCards.first(where: { $0.id == sceneID }) else {
+            savedSceneInteractionGate.endManagement(managementScope)
             sceneManagementMessage = SceneManagementError.sceneNotFound(sceneID).japaneseLabel
             return
         }
+        renameManagementScope = managementScope
         editingSceneID = sceneID
         renameDraft = card.name
     }
 
     func cancelRename() {
+        if let managementScope = renameManagementScope {
+            savedSceneInteractionGate.endManagement(managementScope)
+            renameManagementScope = nil
+        }
         editingSceneID = nil
         renameDraft = ""
     }
@@ -459,7 +475,16 @@ final class ShelfViewModel: ObservableObject {
         guard let sceneID = editingSceneID else { return }
         let name = renameDraft
         let store = sceneStore
+        let managementScope = renameManagementScope
         Task { @MainActor [weak self] in
+            defer {
+                if let self, let managementScope {
+                    self.savedSceneInteractionGate.endManagement(managementScope)
+                    if self.renameManagementScope == managementScope {
+                        self.renameManagementScope = nil
+                    }
+                }
+            }
             do {
                 _ = try await store.rename(sceneID: sceneID, name: name)
                 guard let self else { return }
@@ -474,13 +499,16 @@ final class ShelfViewModel: ObservableObject {
     }
 
     func overwriteSavedScene(sceneID: SceneID) {
+        let managementScope = savedSceneInteractionGate.beginManagement(sceneID: sceneID)
         guard accessibilityStatus.state == .granted else {
+            savedSceneInteractionGate.endManagement(managementScope)
             sceneManagementMessage = "権限がないため現在の配置を取得できません"
             return
         }
         let adapter = accessibilityAdapter
         let store = sceneStore
         Task { @MainActor [weak self] in
+            defer { self?.savedSceneInteractionGate.endManagement(managementScope) }
             guard let scene = await store.scene(sceneID: sceneID) else {
                 guard let self else { return }
                 sceneManagementMessage = SceneManagementError.sceneNotFound(sceneID).japaneseLabel
@@ -515,8 +543,10 @@ final class ShelfViewModel: ObservableObject {
     }
 
     func duplicateSavedScene(sceneID: SceneID) {
+        let managementScope = savedSceneInteractionGate.beginManagement(sceneID: sceneID)
         let store = sceneStore
         Task { @MainActor [weak self] in
+            defer { self?.savedSceneInteractionGate.endManagement(managementScope) }
             do {
                 let duplicate = try await store.duplicate(sceneID: sceneID)
                 guard let self else { return }
@@ -541,8 +571,10 @@ final class ShelfViewModel: ObservableObject {
     }
 
     func moveSavedScene(sceneID: SceneID, direction: SceneMoveDirection) {
+        let managementScope = savedSceneInteractionGate.beginManagement(sceneID: sceneID)
         let store = sceneStore
         Task { @MainActor [weak self] in
+            defer { self?.savedSceneInteractionGate.endManagement(managementScope) }
             do {
                 _ = try await store.move(sceneID: sceneID, direction: direction)
                 guard let self else { return }
@@ -556,15 +588,26 @@ final class ShelfViewModel: ObservableObject {
     }
 
     func requestDelete(sceneID: SceneID) {
+        if let existingScope = pendingDeleteManagementScope {
+            savedSceneInteractionGate.endManagement(existingScope)
+            pendingDeleteManagementScope = nil
+        }
+        let managementScope = savedSceneInteractionGate.beginManagement(sceneID: sceneID)
         guard savedCards.contains(where: { $0.id == sceneID }) else {
+            savedSceneInteractionGate.endManagement(managementScope)
             sceneManagementMessage = SceneManagementError.sceneNotFound(sceneID).japaneseLabel
             return
         }
+        pendingDeleteManagementScope = managementScope
         pendingDeleteSceneID = sceneID
         isDeleteConfirmationPresented = true
     }
 
     func cancelDelete() {
+        if let managementScope = pendingDeleteManagementScope {
+            savedSceneInteractionGate.endManagement(managementScope)
+            pendingDeleteManagementScope = nil
+        }
         pendingDeleteSceneID = nil
         isDeleteConfirmationPresented = false
     }
@@ -574,7 +617,16 @@ final class ShelfViewModel: ObservableObject {
         pendingDeleteSceneID = nil
         isDeleteConfirmationPresented = false
         let store = sceneStore
+        let managementScope = pendingDeleteManagementScope
         Task { @MainActor [weak self] in
+            defer {
+                if let self, let managementScope {
+                    self.savedSceneInteractionGate.endManagement(managementScope)
+                    if self.pendingDeleteManagementScope == managementScope {
+                        self.pendingDeleteManagementScope = nil
+                    }
+                }
+            }
             do {
                 try await store.delete(sceneID: sceneID, confirmed: true)
                 guard let self else { return }
@@ -818,8 +870,15 @@ final class ShelfViewModel: ObservableObject {
         let store = sceneStore
         let adapter = accessibilityAdapter
         let backgroundWindowCoordinator = self.backgroundWindowCoordinator
+        let primaryRequest = savedSceneInteractionGate.requestPrimary(sceneID: sceneID)
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // Let management-menu actions from the same AppKit event declare
+            // ownership before this asynchronous primary action starts.
+            await Task.yield()
+            guard savedSceneInteractionGate.consumePrimary(primaryRequest) else {
+                return
+            }
             statusMessage = "保存済み配置を操作中です"
             let operationState = SceneIsolationOperationState()
             let operationTask = Task {
