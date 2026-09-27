@@ -56,11 +56,19 @@ public struct SavedScene: Codable, Equatable, Sendable, Identifiable {
     public let id: SceneID
     public let name: String
     public let windows: [SceneWindowSnapshot]
+    /// Optional for backwards-compatible decoding of pre-Space scenes.
+    public let workspaceContext: WorkspaceContext?
 
-    public init(id: SceneID, name: String, windows: [SceneWindowSnapshot]) {
+    public init(
+        id: SceneID,
+        name: String,
+        windows: [SceneWindowSnapshot],
+        workspaceContext: WorkspaceContext? = nil
+    ) {
         self.id = id
         self.name = name
         self.windows = windows
+        self.workspaceContext = workspaceContext
     }
 }
 
@@ -68,6 +76,10 @@ public enum SceneCaptureError: Error, Equatable, Sendable {
     case emptySelection
     case unregisteredWindow
     case duplicateWindow
+    case workspaceContextUnavailable
+    case windowOutsideCurrentSpace
+    case windowInMultipleSpaces
+    case windowSpaceMissing
 }
 
 public enum SceneCaptureFlow {
@@ -77,7 +89,8 @@ public enum SceneCaptureFlow {
         id: SceneID,
         name: String,
         candidates: [SceneWindowSnapshot],
-        selectedIDs: Set<SceneWindowIdentity>
+        selectedIDs: Set<SceneWindowIdentity>,
+        workspaceContext: WorkspaceContext? = nil
     ) throws -> SavedScene {
         guard !selectedIDs.isEmpty else {
             throw SceneCaptureError.emptySelection
@@ -100,7 +113,8 @@ public enum SceneCaptureFlow {
         return SavedScene(
             id: id,
             name: normalizedName.isEmpty ? defaultName : normalizedName,
-            windows: selected
+            windows: selected,
+            workspaceContext: workspaceContext
         )
     }
 }
@@ -115,6 +129,11 @@ public enum SceneFailureReason: String, Error, Equatable, Sendable {
     case operationFailed
     case bundleNotAllowed
     case targetNotAuthorized
+    case workspaceContextUnavailable
+    case workspaceMismatch
+    case windowOutsideCurrentSpace
+    case windowInMultipleSpaces
+    case windowSpaceMissing
 
     public var japaneseLabel: String {
         switch self {
@@ -136,6 +155,16 @@ public enum SceneFailureReason: String, Error, Equatable, Sendable {
             return "許可されていないBundle IDです"
         case .targetNotAuthorized:
             return "保存対象として選択されていないため操作しません"
+        case .workspaceContextUnavailable:
+            return "Space情報を取得できないため保存・復元できません"
+        case .workspaceMismatch:
+            return "保存時と現在のSpaceが異なるため操作しません"
+        case .windowOutsideCurrentSpace:
+            return "現在のSpace外のウィンドウは操作しません"
+        case .windowInMultipleSpaces:
+            return "複数Spaceに属するウィンドウは操作しません"
+        case .windowSpaceMissing:
+            return "対象ウィンドウのSpace情報を取得できません"
         }
     }
 }
@@ -478,6 +507,8 @@ public actor InMemorySceneStore {
     private var states: [SceneID: SceneState] = [:]
     private var reports: [SceneID: SceneRestoreReport] = [:]
     private let persistence: SceneShelfPersistence?
+    private let workspaceContextProvider: (any WorkspaceContextProviding)?
+    private let windowMembershipProvider: (any WorkspaceWindowMembershipProviding)?
     private var persistenceEntries: [SceneID: ScenePersistenceIndexEntry] = [:]
     private var persistenceLoadAttempted = false
     private var persistenceLoadFailure: ScenePersistenceError?
@@ -485,13 +516,18 @@ public actor InMemorySceneStore {
     private var nextSceneNumber = 1
     private var isBusy = false
     private var currentSceneIDValue: SceneID?
+    private var activeSceneIDsByScope: [String: SceneID] = [:]
 
     public init(
         persistence: SceneShelfPersistence? = nil,
-        persistenceInitializationFailure: ScenePersistenceError? = nil
+        persistenceInitializationFailure: ScenePersistenceError? = nil,
+        workspaceContextProvider: (any WorkspaceContextProviding)? = nil,
+        windowMembershipProvider: (any WorkspaceWindowMembershipProviding)? = nil
     ) {
         self.persistence = persistence
         self.persistenceInitializationFailure = persistenceInitializationFailure
+        self.workspaceContextProvider = workspaceContextProvider
+        self.windowMembershipProvider = windowMembershipProvider
     }
 
     public func loadPersisted() throws -> ScenePersistenceLoadResult {
@@ -512,7 +548,53 @@ public actor InMemorySceneStore {
         }
 
         do {
-            let result = try persistence.load()
+            var result = try persistence.load()
+            if let workspaceContextProvider,
+               result.scenes.contains(where: { $0.workspaceContext == nil }) {
+                let currentContext: WorkspaceContext
+                do {
+                    currentContext = try workspaceContextProvider.currentWorkspaceContext()
+                } catch {
+                    throw ScenePersistenceError.workspaceContextUnavailable
+                }
+                var migratedScenes: [(scene: SavedScene, revision: Int)] = []
+                var migratedEntries = result.indexEntries
+                for scene in result.scenes where scene.workspaceContext == nil {
+                    guard let currentEntry = result.indexEntries.first(where: { $0.sceneID == scene.id }) else {
+                        throw ScenePersistenceError.invalidIndex
+                    }
+                    let revision = try persistence.nextAvailableRevision(
+                        sceneID: scene.id,
+                        after: currentEntry.revision
+                    )
+                    let migrated = SavedScene(
+                        id: scene.id,
+                        name: scene.name,
+                        windows: scene.windows,
+                        workspaceContext: currentContext
+                    )
+                    migratedScenes.append((scene: migrated, revision: revision))
+                    if let entryIndex = migratedEntries.firstIndex(where: { $0.sceneID == scene.id }) {
+                        let entry = migratedEntries[entryIndex]
+                        migratedEntries[entryIndex] = ScenePersistenceIndexEntry(
+                            sceneID: entry.sceneID,
+                            revision: revision,
+                            name: entry.name,
+                            order: entry.order
+                        )
+                    }
+                }
+                try persistence.migrateWorkspaceContexts(
+                    scenes: migratedScenes,
+                    indexEntries: migratedEntries
+                )
+                let migratedByID = Dictionary(uniqueKeysWithValues: migratedScenes.map { ($0.scene.id, $0.scene) })
+                result = ScenePersistenceLoadResult(
+                    scenes: result.scenes.map { migratedByID[$0.id] ?? $0 },
+                    indexEntries: migratedEntries,
+                    diagnostics: result.diagnostics
+                )
+            }
             let loadedEntries = Dictionary(
                 uniqueKeysWithValues: result.indexEntries.map { ($0.sceneID, $0) }
             )
@@ -527,6 +609,7 @@ public actor InMemorySceneStore {
             states = loadedStates
             reports.removeAll()
             currentSceneIDValue = nil
+            activeSceneIDsByScope.removeAll()
             isBusy = false
             nextSceneNumber = diskNextSceneNumber
             persistenceLoadAttempted = true
@@ -564,6 +647,7 @@ public actor InMemorySceneStore {
         guard !isBusy else {
             throw SceneManagementError.busy
         }
+        let workspaceContext = try currentWorkspaceContextForWrite()
         if persistenceInitializationFailure != nil || persistenceLoadFailure != nil {
             throw ScenePersistenceError.saveRejectedAfterLoadFailure
         }
@@ -586,8 +670,10 @@ public actor InMemorySceneStore {
                 id: "scene-\(nextSceneNumber)",
                 name: name,
                 candidates: candidates,
-                selectedIDs: selectedIDs
+                selectedIDs: selectedIDs,
+                workspaceContext: workspaceContext
             )
+            try validateWindowMembership(scene.windows, context: workspaceContext)
             let order = try nextPersistenceOrder(persistenceEntries.values.map(\.order))
             let entry = ScenePersistenceIndexEntry(
                 sceneID: scene.id,
@@ -612,8 +698,10 @@ public actor InMemorySceneStore {
             id: "scene-\(nextSceneNumber)",
             name: name,
             candidates: candidates,
-            selectedIDs: selectedIDs
+            selectedIDs: selectedIDs,
+            workspaceContext: workspaceContext
         )
+        try validateWindowMembership(scene.windows, context: workspaceContext)
         let reservedNextSceneNumber = try incrementedSceneNumber(nextSceneNumber)
         storedScenes.append(scene)
         nextSceneNumber = reservedNextSceneNumber
@@ -632,7 +720,12 @@ public actor InMemorySceneStore {
         }
 
         let current = storedScenes[sceneIndex]
-        let renamed = SavedScene(id: current.id, name: normalizedName, windows: current.windows)
+        let renamed = SavedScene(
+            id: current.id,
+            name: normalizedName,
+            windows: current.windows,
+            workspaceContext: current.workspaceContext
+        )
         var entries = orderedPersistenceEntries()
         if let entryIndex = entries.firstIndex(where: { $0.sceneID == sceneID }) {
             let entry = entries[entryIndex]
@@ -666,6 +759,12 @@ public actor InMemorySceneStore {
         guard Set(current.windows.map(\.identity)).count == current.windows.count else {
             throw SceneManagementError.targetUnavailable(.ambiguousMatch)
         }
+        let currentContext = try currentWorkspaceContextForWrite()
+        if let currentContext,
+           let savedContext = current.workspaceContext,
+           !savedContext.sameScope(as: currentContext) {
+            throw WorkspaceContextError.contextMismatch
+        }
 
         let updatedWindows = try current.windows.map { target in
             let decision = SceneMatcher.resolve(target: target.identity, candidates: candidates)
@@ -680,7 +779,13 @@ public actor InMemorySceneStore {
                 isMinimized: liveSnapshot.isMinimized
             )
         }
-        let overwritten = SavedScene(id: current.id, name: current.name, windows: updatedWindows)
+        let overwritten = SavedScene(
+            id: current.id,
+            name: current.name,
+            windows: updatedWindows,
+            workspaceContext: currentContext ?? current.workspaceContext
+        )
+        try validateWindowMembership(overwritten.windows, context: overwritten.workspaceContext)
         let currentRevision = persistenceEntries[sceneID]?.revision ?? 0
         let nextRevision: Int
         if let persistence {
@@ -730,7 +835,8 @@ public actor InMemorySceneStore {
                     frame: $0.frame,
                     isMinimized: $0.isMinimized
                 )
-            }
+            },
+            workspaceContext: source.workspaceContext
         )
         let entry = ScenePersistenceIndexEntry(
             sceneID: newID,
@@ -761,7 +867,8 @@ public actor InMemorySceneStore {
         case .stashed:
             break
         case .failed:
-            if currentSceneIDValue == sceneID {
+            if currentSceneIDValue == sceneID
+                || activeSceneIDsByScope.values.contains(sceneID) {
                 throw SceneManagementError.sceneActive(sceneID)
             }
         }
@@ -777,6 +884,7 @@ public actor InMemorySceneStore {
         if currentSceneIDValue == sceneID {
             currentSceneIDValue = nil
         }
+        activeSceneIDsByScope = activeSceneIDsByScope.filter { $0.value != sceneID }
         do {
             try persistence?.cleanupRevisions(for: sceneID)
         } catch {
@@ -790,19 +898,50 @@ public actor InMemorySceneStore {
         guard let index = storedScenes.firstIndex(where: { $0.id == sceneID }) else {
             throw SceneManagementError.sceneNotFound(sceneID)
         }
-        let destination: Int
-        switch direction {
-        case .up:
-            destination = index - 1
-        case .down:
-            destination = index + 1
-        }
-        guard storedScenes.indices.contains(destination) else {
-            throw SceneManagementError.orderBoundary
-        }
-
         var reordered = storedScenes
-        reordered.swapAt(index, destination)
+        if let workspaceContextProvider {
+            let currentContext: WorkspaceContext
+            do {
+                currentContext = try workspaceContextProvider.currentWorkspaceContext()
+            } catch {
+                throw WorkspaceContextError.currentContextUnavailable
+            }
+            let visibleIDs = storedScenes.filter {
+                guard let sceneContext = $0.workspaceContext else { return false }
+                return sceneContext.sameScope(as: currentContext)
+            }.map(\.id)
+            guard let visibleIndex = visibleIDs.firstIndex(of: sceneID) else {
+                throw WorkspaceContextError.contextMismatch
+            }
+            let destinationVisibleIndex: Int
+            switch direction {
+            case .up:
+                destinationVisibleIndex = visibleIndex - 1
+            case .down:
+                destinationVisibleIndex = visibleIndex + 1
+            }
+            guard visibleIDs.indices.contains(destinationVisibleIndex) else {
+                throw SceneManagementError.orderBoundary
+            }
+            guard let destination = storedScenes.firstIndex(
+                where: { $0.id == visibleIDs[destinationVisibleIndex] }
+            ) else {
+                throw SceneManagementError.sceneNotFound(sceneID)
+            }
+            reordered.swapAt(index, destination)
+        } else {
+            let destination: Int
+            switch direction {
+            case .up:
+                destination = index - 1
+            case .down:
+                destination = index + 1
+            }
+            guard storedScenes.indices.contains(destination) else {
+                throw SceneManagementError.orderBoundary
+            }
+            reordered.swapAt(index, destination)
+        }
         let reorderedIDs = Set(reordered.map(\.id))
         let retainedUnloadedEntries = orderedPersistenceEntries().filter {
             !reorderedIDs.contains($0.sceneID)
@@ -926,6 +1065,19 @@ public actor InMemorySceneStore {
         }
     }
 
+    public func cards(workspaceContext: WorkspaceContext) -> [SceneCardSnapshot] {
+        storedScenes.filter {
+            guard let context = $0.workspaceContext else { return false }
+            return context.sameScope(as: workspaceContext)
+        }.map {
+            SceneCardSnapshot(
+                id: $0.id,
+                name: $0.name,
+                state: states[$0.id] ?? .stashed
+            )
+        }
+    }
+
     public func state(sceneID: SceneID) -> SceneState? {
         states[sceneID]
     }
@@ -935,7 +1087,27 @@ public actor InMemorySceneStore {
     }
 
     public func currentSceneID() -> SceneID? {
-        currentSceneIDValue
+        guard let workspaceContextProvider else { return currentSceneIDValue }
+        guard let context = try? workspaceContextProvider.currentWorkspaceContext() else {
+            return nil
+        }
+        return activeSceneIDsByScope[context.scopeKey]
+    }
+
+    /// Re-checks the scene's workspace boundary immediately before an AX
+    /// operation. A Space can change while the restore executor is awaiting
+    /// discovery or isolation, so the preflight performed by `clickDetailed`
+    /// is not sufficient by itself.
+    public func workspaceScopeFailure(sceneID: SceneID) -> SceneFailureReason? {
+        guard let scene = storedScenes.first(where: { $0.id == sceneID }) else {
+            return .workspaceContextUnavailable
+        }
+        switch resolveWorkspaceScope(for: scene) {
+        case .legacy, .scoped:
+            return nil
+        case let .failure(reason):
+            return reason
+        }
     }
 
     public func click(
@@ -944,7 +1116,9 @@ public actor InMemorySceneStore {
     ) async -> SceneRoundTripOutcome {
         let previousState = states[sceneID]
         let previousReport = reports[sceneID]
-        let previousCurrentSceneID = currentSceneIDValue
+        let previousCurrentSceneID = workspaceContextProvider == nil
+            ? currentSceneIDValue
+            : nil
         let wasSwitchingScenes = previousCurrentSceneID != nil && previousCurrentSceneID != sceneID
         let outcome = await clickDetailed(sceneID: sceneID) { plan in
             SceneRestoreReport.assuming(
@@ -952,7 +1126,9 @@ public actor InMemorySceneStore {
                 succeeded: await execute(plan)
             )
         }
-        if case .failed = outcome, !wasSwitchingScenes {
+        if case .failed = outcome,
+           workspaceContextProvider == nil,
+           !wasSwitchingScenes {
             // Preserve the P0-3 bool-executor contract atomically. P0-4
             // callers use clickDetailed to expose the Failed card state and
             // retry path.
@@ -980,6 +1156,26 @@ public actor InMemorySceneStore {
             return .busyRejected(sceneID: sceneID)
         }
 
+        let scopeResolution = resolveWorkspaceScope(for: scene)
+        let scopeKey: String?
+        switch scopeResolution {
+        case let .failure(scopeFailure):
+            let report = SceneRestoreReport(
+                sceneID: sceneID,
+                action: .display,
+                outcomes: scene.windows.map {
+                    .failed(target: $0.identity, reason: scopeFailure)
+                }
+            )
+            reports[sceneID] = report
+            states[sceneID] = .failed
+            return .failed(sceneID: sceneID)
+        case .legacy:
+            scopeKey = nil
+        case let .scoped(key):
+            scopeKey = key
+        }
+
         let currentState = states[sceneID] ?? .stashed
         let plan: SceneRestorePlan
         switch currentState {
@@ -993,8 +1189,8 @@ public actor InMemorySceneStore {
 
         isBusy = true
 
-        let previousCurrentSceneID = currentSceneIDValue
-        if let currentSceneID = currentSceneIDValue,
+        let previousCurrentSceneID = activeSceneID(for: scopeKey)
+        if let currentSceneID = previousCurrentSceneID,
            currentSceneID != sceneID,
            let currentScene = storedScenes.first(where: { $0.id == currentSceneID }) {
             states[currentSceneID] = .preparing
@@ -1006,11 +1202,14 @@ public actor InMemorySceneStore {
             guard hideReport.state == .stashed else {
                 // A failed or partial hide leaves the active arrangement as
                 // the safety anchor. The requested scene remains untouched.
-                currentSceneIDValue = previousCurrentSceneID
+                setActiveSceneID(
+                    hideReport.currentSceneID ?? previousCurrentSceneID,
+                    for: scopeKey
+                )
                 isBusy = false
                 return outcome(for: hideReport)
             }
-            currentSceneIDValue = nil
+            setActiveSceneID(nil, for: scopeKey)
         }
 
         states[sceneID] = .preparing
@@ -1018,7 +1217,7 @@ public actor InMemorySceneStore {
         isBusy = false
         reports[sceneID] = report
         states[sceneID] = report.state
-        currentSceneIDValue = report.currentSceneID
+        setActiveSceneID(report.currentSceneID, for: scopeKey)
         return outcome(for: report)
     }
 
@@ -1034,6 +1233,99 @@ public actor InMemorySceneStore {
             return .failed(sceneID: report.sceneID)
         case .preparing:
             return .failed(sceneID: report.sceneID)
+        }
+    }
+
+    private func currentWorkspaceContextForWrite() throws -> WorkspaceContext? {
+        guard let workspaceContextProvider else { return nil }
+        do {
+            return try workspaceContextProvider.currentWorkspaceContext()
+        } catch {
+            throw WorkspaceContextError.currentContextUnavailable
+        }
+    }
+
+    private func validateWindowMembership(
+        _ windows: [SceneWindowSnapshot],
+        context: WorkspaceContext?
+    ) throws {
+        guard workspaceContextProvider != nil else { return }
+        guard let context else {
+            throw WorkspaceContextError.currentContextUnavailable
+        }
+        guard let windowMembershipProvider else {
+            throw WorkspaceContextError.privateAPIUnavailable
+        }
+        do {
+            try windowMembershipProvider.validate(windows: windows, in: context)
+        } catch {
+            throw error
+        }
+    }
+
+    private enum WorkspaceScopeResolution {
+        case legacy
+        case scoped(key: String)
+        case failure(SceneFailureReason)
+    }
+
+    private func resolveWorkspaceScope(for scene: SavedScene) -> WorkspaceScopeResolution {
+        guard let workspaceContextProvider else { return .legacy }
+        guard let savedContext = scene.workspaceContext else {
+            return .failure(.workspaceContextUnavailable)
+        }
+        let currentContext: WorkspaceContext
+        do {
+            currentContext = try workspaceContextProvider.currentWorkspaceContext()
+        } catch {
+            return .failure(.workspaceContextUnavailable)
+        }
+        guard savedContext.sameScope(as: currentContext) else {
+            return .failure(.workspaceMismatch)
+        }
+        guard let windowMembershipProvider else {
+            return .failure(.workspaceContextUnavailable)
+        }
+        do {
+            try windowMembershipProvider.validate(
+                windows: scene.windows,
+                in: currentContext
+            )
+            return .scoped(key: currentContext.scopeKey)
+        } catch let error as WorkspaceContextError {
+            switch error {
+            case .windowOutsideCurrentSpace:
+                return .failure(.windowOutsideCurrentSpace)
+            case .windowInMultipleSpaces:
+                return .failure(.windowInMultipleSpaces)
+            case .windowNotFound:
+                return .failure(.windowSpaceMissing)
+            case .windowAmbiguous:
+                return .failure(.windowSpaceMissing)
+            default:
+                return .failure(.workspaceContextUnavailable)
+            }
+        } catch {
+            return .failure(.workspaceContextUnavailable)
+        }
+    }
+
+    private func activeSceneID(for scopeKey: String?) -> SceneID? {
+        guard workspaceContextProvider != nil else { return currentSceneIDValue }
+        guard let scopeKey else { return nil }
+        return activeSceneIDsByScope[scopeKey]
+    }
+
+    private func setActiveSceneID(_ sceneID: SceneID?, for scopeKey: String?) {
+        guard workspaceContextProvider != nil else {
+            currentSceneIDValue = sceneID
+            return
+        }
+        guard let scopeKey else { return }
+        if let sceneID {
+            activeSceneIDsByScope[scopeKey] = sceneID
+        } else {
+            activeSceneIDsByScope.removeValue(forKey: scopeKey)
         }
     }
 }

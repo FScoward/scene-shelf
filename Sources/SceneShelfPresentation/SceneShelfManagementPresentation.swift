@@ -13,6 +13,9 @@ public enum SceneShelfManagementPresentation {
         if let persistenceError = error as? ScenePersistenceError {
             return persistenceError.japaneseLabel
         }
+        if let workspaceError = error as? WorkspaceContextError {
+            return workspaceError.japaneseLabel
+        }
         return "配置を更新できませんでした"
     }
 

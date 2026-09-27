@@ -9,6 +9,7 @@ public enum ScenePersistenceError: Error, Equatable, Sendable {
     case revisionAlreadyExists(SceneID)
     case atomicWriteFailed
     case saveRejectedAfterLoadFailure
+    case workspaceContextUnavailable
 
     public var japaneseLabel: String {
         switch self {
@@ -26,6 +27,8 @@ public enum ScenePersistenceError: Error, Equatable, Sendable {
             return "保存済み配置を安全に更新できませんでした"
         case .saveRejectedAfterLoadFailure:
             return "保存済み配置の読み込みに失敗したため、上書きを停止しました"
+        case .workspaceContextUnavailable:
+            return "Space情報を取得できないため保存済み配置を移行できません"
         }
     }
 }
@@ -263,7 +266,8 @@ public struct SceneShelfPersistence: Sendable {
                 SavedScene(
                     id: entry.sceneID,
                     name: entry.name,
-                    windows: revision.windows
+                    windows: revision.windows,
+                    workspaceContext: revision.workspaceContext
                 )
             )
         }
@@ -317,7 +321,8 @@ public struct SceneShelfPersistence: Sendable {
                 RevisionDocument(
                     schemaVersion: Self.currentSchemaVersion,
                     sceneID: scene.id,
-                    windows: scene.windows
+                    windows: scene.windows,
+                    workspaceContext: scene.workspaceContext
                 )
             )
         } catch {
@@ -373,6 +378,72 @@ public struct SceneShelfPersistence: Sendable {
             allowingReplace: true,
             fault: fault
         )
+    }
+
+    /// Publishes context-bearing revisions together and replaces the index
+    /// once. If a revision write or the index write fails, the previous index
+    /// remains authoritative and the caller keeps its previous memory state.
+    public func migrateWorkspaceContexts(
+        scenes: [(scene: SavedScene, revision: Int)],
+        indexEntries: [ScenePersistenceIndexEntry]
+    ) throws {
+        guard !scenes.isEmpty,
+              scenes.allSatisfy({ migration in
+                  migration.revision > 0
+                      && isSafeFileComponent(migration.scene.id)
+                      && !migration.scene.windows.isEmpty
+                      && Set(migration.scene.windows.map(\.identity)).count == migration.scene.windows.count
+                      && migration.scene.workspaceContext != nil
+              }) else {
+            throw ScenePersistenceError.invalidIndex
+        }
+        guard isValidIndex(indexEntries),
+              scenes.allSatisfy({ migration in
+                  guard let entry = indexEntries.first(where: { $0.sceneID == migration.scene.id }) else {
+                      return false
+                  }
+                  return entry.revision == migration.revision
+                      && entry.name == migration.scene.name
+              }) else {
+            throw ScenePersistenceError.invalidIndex
+        }
+
+        let fileManager = FileManager.default
+        do {
+            try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+            try fileManager.createDirectory(at: scenesDirectoryURL, withIntermediateDirectories: true)
+        } catch {
+            throw ScenePersistenceError.atomicWriteFailed
+        }
+
+        for migration in scenes {
+            let entry = indexEntries.first { $0.sceneID == migration.scene.id }!
+            let destination = revisionURL(for: entry)
+            guard !fileManager.fileExists(atPath: destination.path) else {
+                throw ScenePersistenceError.revisionAlreadyExists(migration.scene.id)
+            }
+            let data: Data
+            do {
+                data = try JSONEncoder.sceneShelfEncoder.encode(
+                    RevisionDocument(
+                        schemaVersion: Self.currentSchemaVersion,
+                        sceneID: migration.scene.id,
+                        windows: migration.scene.windows,
+                        workspaceContext: migration.scene.workspaceContext
+                    )
+                )
+            } catch {
+                throw ScenePersistenceError.atomicWriteFailed
+            }
+            try Self.atomicWrite(
+                data,
+                to: destination,
+                allowingReplace: false,
+                fault: fault
+            )
+        }
+
+        try commitIndex(indexEntries: indexEntries)
     }
 
     /// Returns the first revision number that cannot collide with an existing
@@ -652,6 +723,7 @@ private struct RevisionDocument: Codable, Sendable {
     let schemaVersion: Int
     let sceneID: SceneID
     let windows: [SceneWindowSnapshot]
+    let workspaceContext: WorkspaceContext?
 }
 
 private extension JSONEncoder {

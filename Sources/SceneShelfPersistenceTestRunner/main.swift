@@ -43,7 +43,298 @@ struct SceneShelfPersistenceTestRunner {
         try testThumbnailCompositeUsesSavedFrameLayoutAndBoundedResolution()
         try testThumbnailCachePublishesAtomicPNGAndPreservesPreviousOnFailure()
         try testThumbnailCacheSupportsDuplicateDeleteAndUpdate()
-        print("SceneShelfPersistenceTestRunner: PASS (32 tests)")
+        try testSavedSceneWorkspaceContextCodableAndLegacyDecode()
+        try await testLegacyWorkspaceContextMigrationIsOneTime()
+        try await testLegacyWorkspaceContextMigrationFailurePreservesOldIndex()
+        try await testWorkspaceMismatchDoesNotExecuteRestore()
+        try await testWorkspaceScopeFailureRechecksMutableContext()
+        try await testWorkspaceActiveScenesStayScopedAcrossSpaceChanges()
+        try await testWorkspaceMoveUsesVisibleScopeOrder()
+        try await testFailedWorkspaceAnchorCannotBeDeleted()
+        print("SceneShelfPersistenceTestRunner: PASS (40 tests)")
+    }
+
+    private static func testSavedSceneWorkspaceContextCodableAndLegacyDecode() throws {
+        let context = testWorkspaceContext()
+        let scene = SavedScene(
+            id: "scene-context",
+            name: "Context",
+            windows: fixtureWindows(),
+            workspaceContext: context
+        )
+        let data = try JSONEncoder().encode(scene)
+        let decoded = try JSONDecoder().decode(SavedScene.self, from: data)
+        try expect(decoded == scene, "SavedScene Codable should retain workspace context")
+
+        var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        object.removeValue(forKey: "workspaceContext")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        let legacy = try JSONDecoder().decode(SavedScene.self, from: legacyData)
+        try expect(legacy.workspaceContext == nil, "legacy SavedScene JSON should decode without context")
+    }
+
+    private static func testLegacyWorkspaceContextMigrationIsOneTime() async throws {
+        let root = try makeTemporaryRoot()
+        defer { removeTemporaryRoot(root) }
+        let persistence = SceneShelfPersistence(rootURL: root)
+        let legacyStore = InMemorySceneStore(persistence: persistence)
+        _ = try await legacyStore.loadPersisted()
+        let legacy = try await legacyStore.save(
+            name: "legacy",
+            candidates: fixtureWindows(),
+            selectedIDs: Set([fixtureWindows()[0].identity])
+        )
+
+        let provider = FixedWorkspaceContextProvider(context: testWorkspaceContext())
+        let migrated = InMemorySceneStore(
+            persistence: persistence,
+            workspaceContextProvider: provider,
+            windowMembershipProvider: NoopWorkspaceWindowMembershipProvider()
+        )
+        let firstLoad = try await migrated.loadPersisted()
+        try expect(firstLoad.scenes.first?.workspaceContext == testWorkspaceContext(), "legacy scene should receive current context")
+        try expect(firstLoad.indexEntries.first?.revision == 2, "migration should publish one new revision")
+        let cards = await migrated.cards(workspaceContext: testWorkspaceContext())
+        try expect(cards.map(\.id) == [legacy.id], "cards should include only the current Space scope")
+
+        let restarted = InMemorySceneStore(
+            persistence: persistence,
+            workspaceContextProvider: provider,
+            windowMembershipProvider: NoopWorkspaceWindowMembershipProvider()
+        )
+        let secondLoad = try await restarted.loadPersisted()
+        try expect(secondLoad.indexEntries.first?.revision == 2, "migration should not create another revision")
+        try expect(secondLoad.scenes.first?.id == legacy.id, "migration must retain scene identity")
+    }
+
+    private static func testLegacyWorkspaceContextMigrationFailurePreservesOldIndex() async throws {
+        let root = try makeTemporaryRoot()
+        defer { removeTemporaryRoot(root) }
+        let normalPersistence = SceneShelfPersistence(rootURL: root)
+        let legacyStore = InMemorySceneStore(persistence: normalPersistence)
+        _ = try await legacyStore.loadPersisted()
+        _ = try await legacyStore.save(
+            name: "legacy",
+            candidates: fixtureWindows(),
+            selectedIDs: Set([fixtureWindows()[0].identity])
+        )
+        let indexURL = root.appendingPathComponent("index.json")
+        let before = try Data(contentsOf: indexURL)
+
+        let failingStore = InMemorySceneStore(
+            persistence: SceneShelfPersistence(rootURL: root, fault: .indexCommit),
+            workspaceContextProvider: FixedWorkspaceContextProvider(context: testWorkspaceContext()),
+            windowMembershipProvider: NoopWorkspaceWindowMembershipProvider()
+        )
+        do {
+            _ = try await failingStore.loadPersisted()
+            throw TestFailure(description: "migration unexpectedly succeeded with index fault")
+        } catch let error as ScenePersistenceError {
+            guard case .atomicWriteFailed = error else {
+                throw TestFailure(description: "unexpected migration failure: \(error)")
+            }
+        }
+        try expect(try Data(contentsOf: indexURL) == before, "failed migration must preserve old index")
+        let oldResult = try normalPersistence.load()
+        try expect(oldResult.scenes.first?.workspaceContext == nil, "failed migration must keep legacy scene authoritative")
+    }
+
+    private static func testWorkspaceMismatchDoesNotExecuteRestore() async throws {
+        let root = try makeTemporaryRoot()
+        defer { removeTemporaryRoot(root) }
+        let persistence = SceneShelfPersistence(rootURL: root)
+        let contextA = testWorkspaceContext()
+        let contextB = WorkspaceContext(displays: [
+            WorkspaceDisplayContext(
+                displayIdentifier: "display-main",
+                currentSpace: WorkspaceSpaceIdentity(uuid: "space-other", id64: 8)
+            )
+        ])
+        let source = InMemorySceneStore(
+            persistence: persistence,
+            workspaceContextProvider: FixedWorkspaceContextProvider(context: contextA),
+            windowMembershipProvider: NoopWorkspaceWindowMembershipProvider()
+        )
+        _ = try await source.loadPersisted()
+        let saved = try await source.save(
+            name: "scoped",
+            candidates: fixtureWindows(),
+            selectedIDs: Set([fixtureWindows()[0].identity])
+        )
+        let target = InMemorySceneStore(
+            persistence: persistence,
+            workspaceContextProvider: FixedWorkspaceContextProvider(context: contextB),
+            windowMembershipProvider: NoopWorkspaceWindowMembershipProvider()
+        )
+        _ = try await target.loadPersisted()
+        let recorder = OperationRecorder()
+        let outcome = await target.clickDetailed(sceneID: saved.id) { plan in
+            await recorder.record()
+            return SceneRestoreReport.assuming(plan: plan, succeeded: true)
+        }
+        try expect(outcome == .failed(sceneID: saved.id), "mismatched Space should fail closed")
+        let writeCount = await recorder.count()
+        try expect(writeCount == 0, "mismatched Space must perform zero restore writes")
+    }
+
+    private static func testWorkspaceScopeFailureRechecksMutableContext() async throws {
+        let contextA = testWorkspaceContext()
+        let contextB = WorkspaceContext(displays: [
+            WorkspaceDisplayContext(
+                displayIdentifier: "display-main",
+                currentSpace: WorkspaceSpaceIdentity(uuid: "space-other", id64: 8)
+            )
+        ])
+        let provider = MutableWorkspaceContextProvider(context: contextA)
+        let store = InMemorySceneStore(
+            workspaceContextProvider: provider,
+            windowMembershipProvider: NoopWorkspaceWindowMembershipProvider()
+        )
+        let candidates = fixtureWindows()
+        let scene = try await store.save(
+            name: "scope recheck",
+            candidates: candidates,
+            selectedIDs: Set([candidates[0].identity])
+        )
+
+        let matchingFailure = await store.workspaceScopeFailure(sceneID: scene.id)
+        try expect(
+            matchingFailure == nil,
+            "matching mutable Space should pass the write-boundary check"
+        )
+        provider.set(context: contextB)
+        let mismatchFailure = await store.workspaceScopeFailure(sceneID: scene.id)
+        try expect(
+            mismatchFailure == .workspaceMismatch,
+            "changed mutable Space should fail the write-boundary check"
+        )
+        provider.set(context: contextA)
+        let restoredFailure = await store.workspaceScopeFailure(sceneID: scene.id)
+        try expect(
+            restoredFailure == nil,
+            "returning to the saved Space should pass the write-boundary check"
+        )
+    }
+
+    private static func testWorkspaceActiveScenesStayScopedAcrossSpaceChanges() async throws {
+        let contextA = testWorkspaceContext()
+        let contextB = WorkspaceContext(displays: [
+            WorkspaceDisplayContext(
+                displayIdentifier: "display-main",
+                currentSpace: WorkspaceSpaceIdentity(uuid: "space-b", id64: 8)
+            )
+        ])
+        let provider = MutableWorkspaceContextProvider(context: contextA)
+        let store = InMemorySceneStore(
+            workspaceContextProvider: provider,
+            windowMembershipProvider: NoopWorkspaceWindowMembershipProvider()
+        )
+        let candidates = fixtureWindows()
+        let selectedIDs = Set([candidates[0].identity])
+        let sceneA1 = try await store.save(
+            name: "A-1",
+            candidates: candidates,
+            selectedIDs: selectedIDs
+        )
+        let sceneA2 = try await store.save(
+            name: "A-2",
+            candidates: candidates,
+            selectedIDs: selectedIDs
+        )
+        provider.set(context: contextB)
+        let sceneB = try await store.save(
+            name: "B",
+            candidates: candidates,
+            selectedIDs: selectedIDs
+        )
+
+        let recorder = PlanRecorder()
+        let displayReport: SceneDetailedRestoreExecutor = { plan in
+            await recorder.record(plan)
+            return SceneRestoreReport.assuming(plan: plan, succeeded: true)
+        }
+        provider.set(context: contextA)
+        _ = await store.clickDetailed(sceneID: sceneA1.id, execute: displayReport)
+        await recorder.clear()
+        provider.set(context: contextB)
+        _ = await store.clickDetailed(sceneID: sceneB.id, execute: displayReport)
+        let bPlans = await recorder.plans()
+        try expect(
+            bPlans.map(\.sceneID) == [sceneB.id],
+            "B click must not hide A scene: \(bPlans.map { $0.sceneID })"
+        )
+        try expect(
+            bPlans.map(\.action) == [.display],
+            "B click must execute display only: \(bPlans.map { $0.action })"
+        )
+
+        await recorder.clear()
+        provider.set(context: contextA)
+        _ = await store.clickDetailed(sceneID: sceneA2.id, execute: displayReport)
+        let aPlans = await recorder.plans()
+        try expect(aPlans.map(\.sceneID) == [sceneA1.id, sceneA2.id], "returning to A must hide its own active scene")
+        try expect(aPlans.map(\.action) == [.hide, .display], "A switch must hide then display within A")
+        let currentSceneID = await store.currentSceneID()
+        try expect(currentSceneID == sceneA2.id, "A scope active scene should be updated independently")
+    }
+
+    private static func testWorkspaceMoveUsesVisibleScopeOrder() async throws {
+        let contextA = testWorkspaceContext()
+        let contextB = WorkspaceContext(displays: [
+            WorkspaceDisplayContext(
+                displayIdentifier: "display-main",
+                currentSpace: WorkspaceSpaceIdentity(uuid: "space-b", id64: 8)
+            )
+        ])
+        let provider = MutableWorkspaceContextProvider(context: contextA)
+        let store = InMemorySceneStore(
+            workspaceContextProvider: provider,
+            windowMembershipProvider: NoopWorkspaceWindowMembershipProvider()
+        )
+        let candidates = fixtureWindows()
+        let selectedIDs = Set([candidates[0].identity])
+        let sceneA = try await store.save(name: "A", candidates: candidates, selectedIDs: selectedIDs)
+        provider.set(context: contextB)
+        let sceneB = try await store.save(name: "B", candidates: candidates, selectedIDs: selectedIDs)
+        provider.set(context: contextA)
+        let sceneC = try await store.save(name: "C", candidates: candidates, selectedIDs: selectedIDs)
+
+        let reordered = try await store.move(sceneID: sceneC.id, direction: .up)
+        try expect(reordered.map(\.id) == [sceneC.id, sceneB.id, sceneA.id], "move should swap visible A-scope neighbors only")
+        let visibleA = await store.cards(workspaceContext: contextA)
+        try expect(visibleA.map(\.id) == [sceneC.id, sceneA.id], "A visible order should become C then A")
+        let visibleB = await store.cards(workspaceContext: contextB)
+        try expect(visibleB.map(\.id) == [sceneB.id], "B scope order should remain unchanged")
+    }
+
+    private static func testFailedWorkspaceAnchorCannotBeDeleted() async throws {
+        let provider = MutableWorkspaceContextProvider(context: testWorkspaceContext())
+        let store = InMemorySceneStore(
+            workspaceContextProvider: provider,
+            windowMembershipProvider: NoopWorkspaceWindowMembershipProvider()
+        )
+        let candidates = fixtureWindows()
+        let scene = try await store.save(
+            name: "failed-anchor",
+            candidates: candidates,
+            selectedIDs: Set([candidates[0].identity])
+        )
+        let succeed: SceneDetailedRestoreExecutor = { plan in
+            SceneRestoreReport.assuming(plan: plan, succeeded: true)
+        }
+        _ = await store.clickDetailed(sceneID: scene.id, execute: succeed)
+        let fail: SceneDetailedRestoreExecutor = { plan in
+            SceneRestoreReport.assuming(plan: plan, succeeded: false)
+        }
+        _ = await store.clickDetailed(sceneID: scene.id, execute: fail)
+        do {
+            try await store.delete(sceneID: scene.id, confirmed: true)
+            throw TestFailure(description: "failed workspace anchor was deleted")
+        } catch let error as SceneManagementError {
+            guard case .sceneActive(scene.id) = error else {
+                throw TestFailure(description: "unexpected delete error: \(error)")
+            }
+        }
     }
 
     private static func testEmptyStoreDoesNotCreateFiles() async throws {
@@ -1049,6 +1340,15 @@ struct SceneShelfPersistenceTestRunner {
         ]
     }
 
+    private static func testWorkspaceContext() -> WorkspaceContext {
+        WorkspaceContext(displays: [
+            WorkspaceDisplayContext(
+                displayIdentifier: "display-main",
+                currentSpace: WorkspaceSpaceIdentity(uuid: "space-main", id64: 7)
+            )
+        ])
+    }
+
     private static func makeTemporaryRoot() throws -> URL {
         let root = fileManager.temporaryDirectory
             .appendingPathComponent("scene-shelf-persistence-\(UUID().uuidString)", isDirectory: true)
@@ -1088,5 +1388,54 @@ struct SceneShelfPersistenceTestRunner {
         } catch is ScenePersistenceError {
             return
         }
+    }
+}
+
+private actor OperationRecorder {
+    private var value = 0
+
+    func record() {
+        value += 1
+    }
+
+    func count() -> Int {
+        value
+    }
+}
+
+private actor PlanRecorder {
+    private var value: [SceneRestorePlan] = []
+
+    func record(_ plan: SceneRestorePlan) {
+        value.append(plan)
+    }
+
+    func plans() -> [SceneRestorePlan] {
+        value
+    }
+
+    func clear() {
+        value.removeAll()
+    }
+}
+
+private final class MutableWorkspaceContextProvider: WorkspaceContextProviding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: WorkspaceContext
+
+    init(context: WorkspaceContext) {
+        value = context
+    }
+
+    func set(context: WorkspaceContext) {
+        lock.lock()
+        value = context
+        lock.unlock()
+    }
+
+    func currentWorkspaceContext() throws -> WorkspaceContext {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }

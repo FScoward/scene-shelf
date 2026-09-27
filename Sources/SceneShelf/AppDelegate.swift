@@ -35,6 +35,28 @@ private actor SceneIsolationOperationState {
     }
 }
 
+private final class ActiveSpaceObserverToken: @unchecked Sendable {
+    private let center: NotificationCenter
+    private let token: NSObjectProtocol
+
+    init(
+        center: NotificationCenter,
+        handler: @Sendable @escaping (Notification) -> Void
+    ) {
+        self.center = center
+        self.token = center.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main,
+            using: handler
+        )
+    }
+
+    deinit {
+        center.removeObserver(token)
+    }
+}
+
 @MainActor
 final class ShelfViewModel: ObservableObject {
     private static let fixtureTargetFrame = AXFrame(
@@ -68,6 +90,9 @@ final class ShelfViewModel: ObservableObject {
     @Published private(set) var lastSceneReport: SceneRestoreReport?
     @Published private(set) var accessibilityMessage = "権限なしではFixtureを操作しません"
     @Published private(set) var sceneManagementMessage = ""
+    @Published private(set) var workspaceContextMessage = ""
+    @Published private(set) var workspaceScopeMessage = ""
+    @Published private(set) var currentWorkspaceContext: WorkspaceContext?
     @Published var editingSceneID: SceneID? = nil
     @Published var renameDraft = ""
     @Published var isDeleteConfirmationPresented = false
@@ -83,6 +108,8 @@ final class ShelfViewModel: ObservableObject {
     private let persistenceInitializationError: ScenePersistenceError?
     private let thumbnailCache: SceneThumbnailCache?
     private let thumbnailCaptureService: any SceneThumbnailCapturing
+    private let workspaceContextProvider: any WorkspaceContextProviding
+    private var activeSpaceObserver: ActiveSpaceObserverToken?
 
     private struct DefaultSceneStore {
         let store: InMemorySceneStore
@@ -93,7 +120,11 @@ final class ShelfViewModel: ObservableObject {
         do {
             let persistence = try SceneShelfPersistence.applicationSupport()
             return DefaultSceneStore(
-                store: InMemorySceneStore(persistence: persistence),
+                store: InMemorySceneStore(
+                    persistence: persistence,
+                    workspaceContextProvider: SkyLightWorkspaceContextProvider(),
+                    windowMembershipProvider: SkyLightWorkspaceWindowMembershipProvider()
+                ),
                 initializationError: nil
             )
         } catch let error as ScenePersistenceError {
@@ -122,7 +153,8 @@ final class ShelfViewModel: ObservableObject {
         sceneStore: InMemorySceneStore? = nil,
         accessibilityAdapter: any AXWindowAdapter = AXSystemAdapter(),
         thumbnailCache: SceneThumbnailCache? = nil,
-        thumbnailCaptureService: any SceneThumbnailCapturing = ScreenCaptureKitThumbnailCaptureService()
+        thumbnailCaptureService: any SceneThumbnailCapturing = ScreenCaptureKitThumbnailCaptureService(),
+        workspaceContextProvider: any WorkspaceContextProviding = SkyLightWorkspaceContextProvider()
     ) {
         self.coordinator = coordinator
         if let sceneStore {
@@ -136,11 +168,23 @@ final class ShelfViewModel: ObservableObject {
         self.accessibilityAdapter = accessibilityAdapter
         self.thumbnailCache = thumbnailCache ?? Self.makeDefaultThumbnailCache()
         self.thumbnailCaptureService = thumbnailCaptureService
+        self.workspaceContextProvider = workspaceContextProvider
+        activeSpaceObserver = ActiveSpaceObserverToken(
+            center: NSWorkspace.shared.notificationCenter
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.refresh()
+            }
+        }
         Task { @MainActor [weak self] in
             await self?.loadPersistedScenes()
             await self?.refresh()
             await self?.refreshAccessibilityPermission()
         }
+    }
+
+    deinit {
+        activeSpaceObserver = nil
     }
 
     private func loadPersistedScenes(retry: Bool = false) async {
@@ -198,11 +242,48 @@ final class ShelfViewModel: ObservableObject {
         let snapshot = await coordinator.snapshot()
         cards = snapshot.cards
         let scenes = await sceneStore.scenes()
-        savedCards = await sceneStore.cards()
-        savedScenePreviews = SceneShelfPreviewPresentation.previews(for: scenes)
+        let currentContext: WorkspaceContext
+        do {
+            currentContext = try workspaceContextProvider.currentWorkspaceContext()
+            workspaceContextMessage = ""
+        } catch let error as WorkspaceContextError {
+            currentWorkspaceContext = nil
+            workspaceContextMessage = error.japaneseLabel
+            workspaceScopeMessage = ""
+            savedCards = []
+            savedScenePreviews = [:]
+            savedSceneThumbnailData = [:]
+            savedSceneThumbnailStates = [:]
+            savedCardFailureMessages = [:]
+            return
+        } catch {
+            currentWorkspaceContext = nil
+            workspaceContextMessage = WorkspaceContextError.currentContextUnavailable.japaneseLabel
+            workspaceScopeMessage = ""
+            savedCards = []
+            savedScenePreviews = [:]
+            savedSceneThumbnailData = [:]
+            savedSceneThumbnailStates = [:]
+            savedCardFailureMessages = [:]
+            return
+        }
+        currentWorkspaceContext = currentContext
+        let scopedScenes = scenes.filter {
+            guard let context = $0.workspaceContext else { return false }
+            return context.sameScope(as: currentContext)
+        }
+        let scopedSceneIDs = Set(scopedScenes.map(\.id))
+        savedCardFailureMessages = savedCardFailureMessages.filter {
+            scopedSceneIDs.contains($0.key)
+        }
+        savedCards = await sceneStore.cards(workspaceContext: currentContext)
+        workspaceScopeMessage = scopedScenes.isEmpty
+            ? "このSpaceに保存済み配置はありません"
+            : ""
+        savedScenePreviews = SceneShelfPreviewPresentation.previews(for: scopedScenes)
         var thumbnailData: [SceneID: Data] = [:]
         var thumbnailStates: [SceneID: SceneThumbnailState] = [:]
-        for scene in scenes {
+        for scene in scopedScenes {
             if let thumbnailCache {
                 do {
                     if let data = try thumbnailCache.read(sceneID: scene.id) {
@@ -345,6 +426,9 @@ final class ShelfViewModel: ObservableObject {
                 guard let self else { return }
                 accessibilityMessage = error.japaneseLabel
             } catch let error as ScenePersistenceError {
+                guard let self else { return }
+                accessibilityMessage = error.japaneseLabel
+            } catch let error as WorkspaceContextError {
                 guard let self else { return }
                 accessibilityMessage = error.japaneseLabel
             } catch let error as SceneManagementError {
@@ -690,6 +774,8 @@ final class ShelfViewModel: ObservableObject {
                 applicationCatalogMessage = error.japaneseLabel
             } catch let error as ScenePersistenceError {
                 applicationCatalogMessage = error.japaneseLabel
+            } catch let error as WorkspaceContextError {
+                applicationCatalogMessage = error.japaneseLabel
             } catch let error as SceneManagementError {
                 applicationCatalogMessage = SceneShelfManagementPresentation.message(for: error)
             } catch {
@@ -741,6 +827,14 @@ final class ShelfViewModel: ObservableObject {
             let operationState = SceneIsolationOperationState()
             let operationTask = Task {
                 await store.clickDetailed(sceneID: sceneID) { basePlan in
+                    if let failureReason = await store.workspaceScopeFailure(
+                        sceneID: basePlan.sceneID
+                    ) {
+                        return Self.restoreReportBlockingRemaining(
+                            plan: basePlan,
+                            reason: failureReason
+                        )
+                    }
                     if basePlan.action == .display {
                         let isolationResult = await backgroundWindowCoordinator.isolateBeforeDisplay(
                             excluding: Set(
@@ -757,22 +851,46 @@ final class ShelfViewModel: ObservableObject {
                                 reason: failure.reason
                             )
                         }
+                        if let failureReason = await store.workspaceScopeFailure(
+                            sceneID: basePlan.sceneID
+                        ) {
+                            return Self.restoreReportBlockingRemaining(
+                                plan: basePlan,
+                                reason: failureReason
+                            )
+                        }
                     }
                     let plan = await Self.prepareRestorePlan(
                         basePlan,
                         adapter: adapter
                     )
+                    if let failureReason = await store.workspaceScopeFailure(
+                        sceneID: basePlan.sceneID
+                    ) {
+                        return Self.restoreReportBlockingRemaining(
+                            plan: plan,
+                            reason: failureReason
+                        )
+                    }
                     let authorizationScope = AXAuthorizationScope(
                         allowedTargets: Set(
                             basePlan.instructions.map { Self.axIdentity(from: $0.target) }
                         )
                     )
                     var executedOutcomes: [SceneTargetRestoreOutcome] = []
-                    for instruction in plan.instructions {
+                    for (index, instruction) in plan.instructions.enumerated() {
                         let request = Self.axRequest(
                             from: instruction,
                             authorizationScope: authorizationScope
                         )
+                        if let failureReason = await store.workspaceScopeFailure(
+                            sceneID: basePlan.sceneID
+                        ) {
+                            executedOutcomes.append(contentsOf: plan.instructions[index...].map {
+                                .failed(target: $0.target, reason: failureReason)
+                            })
+                            break
+                        }
                         let report = await adapter.perform(request)
                         let appliedOperations = report.appliedOperations.compactMap {
                             SceneWindowOperation(rawValue: $0.rawValue)
@@ -925,6 +1043,25 @@ final class ShelfViewModel: ObservableObject {
         )
     }
 
+    nonisolated private static func restoreReportBlockingRemaining(
+        plan: SceneRestorePlan,
+        reason: SceneFailureReason,
+        executedOutcomes: [SceneTargetRestoreOutcome] = []
+    ) -> SceneRestoreReport {
+        let executedTargets = Set(executedOutcomes.map(\.target))
+        let blockedOutcomes: [SceneTargetRestoreOutcome] = plan.instructions.compactMap { instruction in
+            guard !executedTargets.contains(instruction.target) else { return nil }
+            return SceneTargetRestoreOutcome.failed(
+                target: instruction.target,
+                reason: reason
+            )
+        }
+        return SceneRestoreReport.from(
+            plan: plan,
+            executedOutcomes: executedOutcomes + blockedOutcomes
+        )
+    }
+
     nonisolated private static func prepareRestorePlan(
         _ basePlan: SceneRestorePlan,
         adapter: any AXWindowAdapter
@@ -1008,6 +1145,14 @@ private extension SceneCaptureError {
             return "検出済みFixture以外は保存できません"
         case .duplicateWindow:
             return "同じFixtureウィンドウを重複して保存できません"
+        case .workspaceContextUnavailable:
+            return "Space情報を取得できないため保存できません"
+        case .windowOutsideCurrentSpace:
+            return "現在のSpace外のウィンドウは保存できません"
+        case .windowInMultipleSpaces:
+            return "複数Spaceに属するウィンドウは保存できません"
+        case .windowSpaceMissing:
+            return "対象ウィンドウのSpace情報を取得できません"
         }
     }
 }
@@ -1031,7 +1176,13 @@ struct ShelfView: View {
             .padding(.vertical, 8)
             .sceneShelfGlassSurface(.header)
 
-            if !viewModel.savedCards.isEmpty {
+            if !viewModel.workspaceContextMessage.isEmpty {
+                Text(viewModel.workspaceContextMessage)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("workspace-context-error")
+            } else if !viewModel.savedCards.isEmpty {
                 Divider()
                 Text("保存済み配置")
                     .font(.subheadline.weight(.semibold))
@@ -1155,6 +1306,15 @@ struct ShelfView: View {
                         )
                     }
                 }
+            } else if !viewModel.workspaceScopeMessage.isEmpty {
+                Divider()
+                Text("保存済み配置")
+                    .font(.subheadline.weight(.semibold))
+                Text(viewModel.workspaceScopeMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("workspace-scope-empty")
             }
 
             if !viewModel.persistenceDiagnosticRows.isEmpty {
@@ -1455,7 +1615,11 @@ final class SceneShelfAppDelegate: NSObject, NSApplicationDelegate {
         let coordinator = SceneCoordinator(scenes: [])
         let viewModel = ShelfViewModel(
             coordinator: coordinator,
-            sceneStore: InMemorySceneStore(persistence: persistence),
+            sceneStore: InMemorySceneStore(
+                persistence: persistence,
+                workspaceContextProvider: SkyLightWorkspaceContextProvider(),
+                windowMembershipProvider: SkyLightWorkspaceWindowMembershipProvider()
+            ),
             accessibilityAdapter: AXSystemAdapter()
         )
         self.viewModel = viewModel

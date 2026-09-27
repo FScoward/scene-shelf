@@ -82,8 +82,198 @@ struct SceneShelfCoreTestRunner {
             expect(outcome == .emptyShelf)
         }
 
+        await run("workspace context canonicalizes displays and scopes by UUID") {
+            let first = WorkspaceDisplayContext(
+                displayIdentifier: "display-b",
+                currentSpace: WorkspaceSpaceIdentity(uuid: "uuid-b", id64: 22)
+            )
+            let second = WorkspaceDisplayContext(
+                displayIdentifier: "display-a",
+                currentSpace: WorkspaceSpaceIdentity(uuid: "uuid-a", id64: 11)
+            )
+            let reordered = WorkspaceContext(displays: [first, second])
+            let renumbered = WorkspaceContext(displays: [
+                WorkspaceDisplayContext(
+                    displayIdentifier: "display-a",
+                    currentSpace: WorkspaceSpaceIdentity(uuid: "uuid-a", id64: 101)
+                ),
+                WorkspaceDisplayContext(
+                    displayIdentifier: "display-b",
+                    currentSpace: WorkspaceSpaceIdentity(uuid: "uuid-b", id64: 202)
+                )
+            ])
+            expect(reordered.displays.map(\.displayIdentifier) == ["display-a", "display-b"])
+            expect(reordered.sameScope(as: renumbered))
+            expect(reordered.scopeKey == "display-a=uuid-a|display-b=uuid-b")
+        }
+
+        await run("workspace context Codable rejects malformed payload") {
+            let valid = WorkspaceContext(displays: [
+                WorkspaceDisplayContext(
+                    displayIdentifier: "display-a",
+                    currentSpace: WorkspaceSpaceIdentity(uuid: "uuid-a", id64: 1)
+                )
+            ])
+            let data = try? JSONEncoder().encode(valid)
+            let decoded = data.flatMap { try? JSONDecoder().decode(WorkspaceContext.self, from: $0) }
+            expect(decoded == valid)
+            let malformed = try? JSONDecoder().decode(
+                WorkspaceContext.self,
+                from: Data(#"{"displays":[]}"#.utf8)
+            )
+            expect(malformed == nil)
+        }
+
+        await run("workspace membership policy fails closed for outside, multiple, and missing") {
+            let context = WorkspaceContext(displays: [
+                WorkspaceDisplayContext(
+                    displayIdentifier: "display-a",
+                    currentSpace: WorkspaceSpaceIdentity(uuid: "uuid-a", id64: 1)
+                )
+            ])
+            let target = SceneWindowIdentity(
+                bundleIdentifier: "com.example.app",
+                processID: 10,
+                title: "Main"
+            )
+            expect(WorkspaceWindowMembershipPolicy.evaluate(target: target, spaceIDs: [1], context: context).membership == .current)
+            expect(WorkspaceWindowMembershipPolicy.evaluate(target: target, spaceIDs: [2], context: context).membership == .outside)
+            expect(WorkspaceWindowMembershipPolicy.evaluate(target: target, spaceIDs: [1, 2], context: context).membership == .multiple)
+            expect(WorkspaceWindowMembershipPolicy.evaluate(target: target, spaceIDs: [], context: context).membership == .missing)
+        }
+
+        await run("workspace window resolver accepts a unique window after frame change") {
+            let target = SceneWindowSnapshot(
+                identity: SceneWindowIdentity(
+                    bundleIdentifier: "com.example.app",
+                    processID: 10,
+                    title: "Main"
+                ),
+                frame: SceneFrame(x: 10, y: 10, width: 400, height: 300),
+                isMinimized: false
+            )
+            let candidates = [
+                WorkspaceWindowCandidate(
+                    windowID: 21,
+                    bundleIdentifier: "com.example.app",
+                    processID: 10,
+                    title: "Main",
+                    frame: SceneFrame(x: 500, y: 200, width: 800, height: 600)
+                )
+            ]
+            expect(
+                WorkspaceWindowResolver.resolve(target: target, candidates: candidates)
+                    == .matched(windowID: 21)
+            )
+        }
+
+        await run("workspace window resolver uses frame to disambiguate duplicate identities") {
+            let target = SceneWindowSnapshot(
+                identity: SceneWindowIdentity(
+                    bundleIdentifier: "com.example.app",
+                    processID: 10,
+                    title: "Main"
+                ),
+                frame: SceneFrame(x: 10, y: 10, width: 400, height: 300),
+                isMinimized: false
+            )
+            let candidates = [
+                WorkspaceWindowCandidate(
+                    windowID: 21,
+                    bundleIdentifier: "com.example.app",
+                    processID: 10,
+                    title: "Main",
+                    frame: target.frame
+                ),
+                WorkspaceWindowCandidate(
+                    windowID: 22,
+                    bundleIdentifier: "com.example.app",
+                    processID: 10,
+                    title: "Main",
+                    frame: SceneFrame(x: 800, y: 400, width: 500, height: 400)
+                )
+            ]
+            expect(
+                WorkspaceWindowResolver.resolve(target: target, candidates: candidates)
+                    == .matched(windowID: 21)
+            )
+        }
+
+        await run("workspace window resolver fails when duplicate identities stay ambiguous") {
+            let target = SceneWindowSnapshot(
+                identity: SceneWindowIdentity(
+                    bundleIdentifier: "com.example.app",
+                    processID: 10,
+                    title: "Main"
+                ),
+                frame: SceneFrame(x: 10, y: 10, width: 400, height: 300),
+                isMinimized: false
+            )
+            let candidates = [
+                WorkspaceWindowCandidate(
+                    windowID: 21,
+                    bundleIdentifier: "com.example.app",
+                    processID: 10,
+                    title: "Main",
+                    frame: SceneFrame(x: 10, y: 10, width: 400, height: 300)
+                ),
+                WorkspaceWindowCandidate(
+                    windowID: 22,
+                    bundleIdentifier: "com.example.app",
+                    processID: 10,
+                    title: "Main",
+                    frame: SceneFrame(x: 12, y: 12, width: 402, height: 302)
+                )
+            ]
+            expect(
+                WorkspaceWindowResolver.resolve(target: target, candidates: candidates)
+                    == .ambiguous
+            )
+        }
+
+        await run("SkyLight payload parser accepts multiple displays and rejects malformed payload") {
+            let payload: [[String: Any]] = [
+                [
+                    "Display Identifier": "display-b",
+                    "Current Space": ["uuid": "uuid-b", "ManagedSpaceID": NSNumber(value: 22)]
+                ],
+                [
+                    "Display Identifier": "display-a",
+                    "Current Space": ["uuid": "uuid-a", "ManagedSpaceID": NSNumber(value: 11)]
+                ]
+            ]
+            let context = try? WorkspaceContextPayloadParser.parse(payload)
+            expect(context?.displays.map(\.displayIdentifier) == ["display-a", "display-b"])
+            let malformed = try? WorkspaceContextPayloadParser.parse([
+                ["Display Identifier": "display-a"]
+            ])
+            expect(malformed == nil)
+        }
+
+        await run("workspace membership payload parser rejects invalid numeric values") {
+            let valid = try? WorkspaceSpaceMembershipPayloadParser.parse([
+                NSNumber(value: 7),
+                ["ManagedSpaceID": NSNumber(value: 8)] as [String: Any]
+            ])
+            expect(valid == [7, 8])
+
+            let negative = try? WorkspaceSpaceMembershipPayloadParser.parse([
+                NSNumber(value: -1)
+            ])
+            let fraction = try? WorkspaceSpaceMembershipPayloadParser.parse([
+                NSNumber(value: 1.5)
+            ])
+            let mixed = try? WorkspaceSpaceMembershipPayloadParser.parse([
+                NSNumber(value: 7),
+                ["unexpected": NSNumber(value: 9)] as [String: Any]
+            ])
+            expect(negative == nil)
+            expect(fraction == nil)
+            expect(mixed == nil)
+        }
+
         if failures == 0 {
-            print("SceneShelfCoreTestRunner: 6 tests passed")
+            print("SceneShelfCoreTestRunner: tests passed")
         } else {
             print("SceneShelfCoreTestRunner: \(failures) failures")
             Foundation.exit(1)
